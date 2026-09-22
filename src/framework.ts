@@ -97,6 +97,7 @@ import {
 } from './code-execution/tool-definition.js';
 import { splitProseSegments } from './prose-segments.js';
 import { cumulativeDelta } from './usage-accounting.js';
+import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 
 /** Detect a supported image media type from magic bytes (the model API
  *  rejects mislabeled media types, so trust bytes over extensions).
@@ -6523,6 +6524,12 @@ export class AgentFramework {
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
     };
+    // Output tokens billed since this turn's assistant blocks were last
+    // persisted. The residual over the round's visible blocks is the price of
+    // its hidden thinking, stamped on the signed blocks at persist time
+    // (thinking-token-stamp.ts). Accumulates across max_tokens continuations
+    // within a round; reset at each stamp.
+    let outputTokensSinceStamp = 0;
     // This turn's alive-marker, set at startAgentStream entry. Safe to read
     // from the map here: the turn-alive busy check in processInferenceRequests
     // means no successor turn can have replaced it while we compiled.
@@ -6786,6 +6793,8 @@ export class AgentFramework {
                 });
               }
             }
+            assistantBlocks = stampThinkingTokenEstimates(assistantBlocks, outputTokensSinceStamp);
+            outputTokensSinceStamp = 0;
             this.pendingAssistantBlocks.set(agent.name, assistantBlocks);
 
             // Note: max_tokens truncation cannot produce tool-calls events here.
@@ -6934,9 +6943,11 @@ export class AgentFramework {
                 b.type === 'tool_use' || b.type === 'tool_result' ? i : last,
               -1
             );
-            const terminalContent = lastToolIdx >= 0
-              ? response.content.slice(lastToolIdx + 1)
-              : response.content;
+            const terminalContent = stampThinkingTokenEstimates(
+              lastToolIdx >= 0 ? response.content.slice(lastToolIdx + 1) : response.content,
+              outputTokensSinceStamp,
+            );
+            outputTokensSinceStamp = 0;
             // This is a whole-response boundary, not a trailing-prose
             // classifier. If the turn executed any genuine structured tool
             // call, preserve its later prose exactly as ordinary history.
@@ -7540,6 +7551,7 @@ export class AgentFramework {
               ),
             };
             previousUsage = cumulativeUsage;
+            outputTokensSinceStamp += perCallUsage.outputTokens;
             const strat = (agent as unknown as {
               getContextManager?: () => { getStrategy?: () => unknown };
             }).getContextManager?.()?.getStrategy?.() as
