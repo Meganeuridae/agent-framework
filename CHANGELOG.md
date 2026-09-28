@@ -12,6 +12,43 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.19.0 — 2026-09-28
+
+### Added
+
+- `journal({content})` — a synthesized private note-taking tool beside `think`
+  and `skip_reply`. The entry stays in the agent's own context and is sent
+  nowhere; it does not end the turn and does not affect prose routing. It exists
+  because long prose kept in `skip_reply.reason` (or `think.content`) makes
+  replayed history read as a reasoning trace, and every memory-compression
+  request over it is refused `reasoning_extraction` regardless of content,
+  while the same prose in a note-taking tool passes. Context-manager's
+  `compressionToolProseFallback` rung rewrites old history into calls to this
+  tool and mirrors its result wording.
+
+### Changed
+
+- `classifyInferenceError` matches context-manager's `OverBudgetError` /
+  `UncoveredDropError` with a real cross-package `instanceof` now that CM
+  exports them from its package root (context-manager#41/#71 — the follow-up
+  promised there). The `err.name` comparison is kept as a fallback for
+  deployments carrying two CM copies, and the message-prose match remains a
+  last resort for serialized reasons; neither classification changes.
+
+- `skip_reply.reason` is now described as ONE short line (under ~100
+  characters), pointing at `journal()` for anything longer. Description only —
+  no length is enforced and existing calls behave exactly as before.
+
+### Fixed
+
+- `channels/changed` is answered before the host reconciles the added
+  channels, as `channels/register` already was (#160). Reconciling sends
+  `channels/open` or `channels/close` back to the server, and a server that
+  announced from inside a request it was serving (a tool that refreshes or
+  subscribes) could not read them until its announcement was answered, so
+  both sides waited until one timed out. In zulip-mcp this left streams the
+  bot joined after startup as `Unknown channel` until a restart.
+
 ## 0.18.0 — 2026-09-25
 
 ### Changed
