@@ -791,7 +791,8 @@ export class ChannelRegistry {
       }
     }
 
-    // Process added channels (validate per-descriptor, register, reconcile)
+    // Process added channels (validate per-descriptor, register; reconcile
+    // after responding, below)
     const accepted: typeof params.added = [];
     if (params.added) {
       for (const channel of params.added) {
@@ -810,9 +811,17 @@ export class ChannelRegistry {
         addedResults.push({ id: channel.id, accepted: true });
         accepted.push(channel);
       }
-      if (accepted.length > 0) await this.reconcileChannels(serverId, accepted);
     }
+
+    // Respond before reconciliation, as handleRegister does. A server that
+    // announces from inside a request it is serving (a tool that refreshes
+    // or subscribes) cannot read the channels/open or channels/close that
+    // reconciling sends until this response arrives; reconciling first
+    // deadlocks both sides until one times out (#160). The verdicts are
+    // settled above, so nothing in the response depends on reconciling.
     responder?.respond({ results: addedResults });
+
+    if (accepted.length > 0) await this.reconcileChannels(serverId, accepted);
 
     this.emitTraceFn({
       type: 'mcpl:channels-changed',
