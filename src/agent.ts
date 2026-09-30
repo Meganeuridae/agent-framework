@@ -522,7 +522,34 @@ export class Agent {
     this.updateHotContextSettings({ preparedWindowTokens: null });
   }
 
+  /**
+   * RFC-006 consumed watermark: the newest stored message at the last compile
+   * of a model request, per branch. Everything above it has never been in a
+   * request and may still be replaced or withdrawn in place by its sender.
+   */
+  private consumedWatermark: { branch: string; sequence: number } | null = null;
+
+  getConsumedWatermark(): { branch: string; sequence: number } | null {
+    return this.consumedWatermark;
+  }
+
+  /** Mark everything currently stored as consumed (boot, branch switch). */
+  markContextConsumed(): void {
+    // Tolerate partial context-manager doubles (tests build Agents over
+    // stubs): without a watermark nothing is ever treated as unread.
+    const cm = this.contextManager as Partial<ContextManager>;
+    try {
+      if (typeof cm.currentBranch !== 'function' || typeof cm.getAllMessages !== 'function') return;
+      const count = typeof cm.getMessageCount === 'function' ? cm.getMessageCount() : cm.getAllMessages().length;
+      const last = count > 0 ? cm.getAllMessages().at(-1) : undefined;
+      this.consumedWatermark = { branch: cm.currentBranch().name, sequence: last?.sequence ?? 0 };
+    } catch {
+      this.consumedWatermark = null;
+    }
+  }
+
   async compileContext(budget?: TokenBudget): Promise<CompileResult> {
+    this.markContextConsumed();
     const result = await this.contextManager.compile(this.resolveBudget(budget));
     if (!budget) this.settleRuntimeSettingsTransition();
     return result;
@@ -538,6 +565,7 @@ export class Agent {
     injections?: ContextInjection[],
     opts?: { kvUnifiedImmutablePrefixHash?: string },
   ): Promise<CompileResult> {
+    this.markContextConsumed();
     const result = await this.contextManager.compile(
       this.resolveBudget(budget), injections, opts as never,
     );

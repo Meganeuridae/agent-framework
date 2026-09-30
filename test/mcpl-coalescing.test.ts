@@ -1,0 +1,587 @@
+/**
+ * RFC-006 event coalescing (mcpl PR #5, revision 7) — wire-level tests over a
+ * real loopback WebSocket MCPL server and a mock model provider.
+ *
+ * Vector numbers refer to RFC-006 §14.
+ */
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { once } from 'node:events';
+import { WebSocketServer, type WebSocket } from 'ws';
+import type { AddressInfo } from 'node:net';
+import type { FrameworkConfig } from '../src/types/framework.js';
+import { AgentFramework } from '../src/framework.js';
+import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+
+const TS = '2026-09-30T00:00:00Z';
+const ok = () => createMockResponse([{ type: 'text', text: 'ok' }]);
+
+async function fixture(options: { server?: Record<string, unknown>; framework?: Partial<FrameworkConfig>; agents?: unknown[] } = {}) {
+  const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+  await once(wss, 'listening');
+  let online = true;
+  let socket: WebSocket;
+  let next = 1000;
+  const replies = new Map<number, (value: unknown) => void>();
+  const renders: Array<Record<string, unknown>> = [];
+  const hostCaps: Array<Record<string, unknown>> = [];
+  const published: Array<Record<string, unknown>> = [];
+  let renderer: (params: Record<string, unknown>) => Promise<unknown> = async () => ({ content: [{ type: 'text', text: 'document_diff' }] });
+  wss.on('connection', (ws) => {
+    if (!online) { ws.close(); return; }
+    socket = ws;
+    ws.on('message', async (bytes) => {
+      const m = JSON.parse(String(bytes));
+      if (!m.method) { replies.get(m.id)?.(m); replies.delete(m.id); return; }
+      const reply = (result: unknown) => ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }));
+      if (m.method === 'initialize') {
+        hostCaps.push(m.params.capabilities.experimental.mcpl);
+        reply({ protocolVersion: '2024-11-05', capabilities: { tools: {}, experimental: { mcpl: {
+          version: '0.5', pushEvents: true, inferenceRequest: true,
+          channels: { incoming: true, register: true, lifecycle: true, publish: true },
+          featureSets: { doc: { description: 'doc', uses: ['pushEvents'] } },
+        } } }, serverInfo: { name: 'editor', version: '1' } });
+      } else if (m.method === 'featureSets/update') reply({ accepted: true });
+      else if (m.method === 'tools/list') reply({ tools: [] });
+      else if (m.method === 'channels/publish') { published.push(m.params); if (m.id !== undefined) reply({ delivered: true }); }
+      else if (m.method === 'channels/close') reply({ closed: true });
+      else if (m.method === 'channels/open') reply({ channel: { id: m.params.channelId, type: 'discord', label: m.params.channelId } });
+      else if (m.method === 'push/render') { renders.push(m.params); reply(await renderer(m.params)); }
+      else if (m.id !== undefined) reply({});
+    });
+  });
+  const dir = mkdtempSync(join(tmpdir(), 'coalescing-'));
+  let framework: AgentFramework;
+  const membrane = new MockMembrane();
+  membrane.pushResponse(ok());
+  const create = async (grantPush = true) => {
+    framework = await AgentFramework.create({
+      storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
+      agents: (options.agents ?? [{ name: 'agent', model: 'test', systemPrompt: 'test' }]) as FrameworkConfig['agents'],
+      modules: [], ...options.framework,
+      mcplServers: [{ id: 'editor', url: `ws://127.0.0.1:${(wss.address() as AddressInfo).port}`, enabledFeatureSets: ['doc'],
+        ...options.server, ...(grantPush ? {} : { disabledCapabilities: ['pushEvents'] }) }],
+    } as FrameworkConfig);
+    return framework;
+  };
+  const send = (method: string, params: unknown): Promise<any> => new Promise((resolve, reject) => {
+    const id = next++;
+    const timer = setTimeout(() => reject(new Error(`no reply to ${method}`)), 3000);
+    replies.set(id, (value) => { clearTimeout(timer); resolve(value); });
+    socket.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }));
+  });
+  await create();
+  return {
+    get framework() { return framework; }, membrane, renders, hostCaps, published, create, send, dir,
+    disconnect: () => socket.terminate(),
+    online: (value: boolean) => { online = value; },
+    register: (id = 'chat') => send('channels/register', { channels: [{ id, type: 'discord', label: id, metadata: { channelType: 'guild_text' } }] }),
+    /** A coalesced channels/incoming message for platform message `m`. */
+    channel: (eventId: string, text: string, flags: Record<string, unknown> = {}, channelId = 'chat', messageId = 'm') => ({
+      channelId, messageId, eventId, timestamp: TS, author: { id: 'u', name: 'User' }, tags: ['chat:mention'],
+      content: text ? [{ type: 'text', text }] : [], coalesce: { key: `message:${messageId}`, ...flags },
+    }),
+    /** A coalesced feature-set push. */
+    params: (eventId: string, text: string, flags: Record<string, unknown> = {}) => ({
+      featureSet: 'doc', eventId, timestamp: TS, coalesce: { key: 'document', ...flags },
+      payload: { content: text ? [{ type: 'text', text }] : [] },
+    }),
+    renderer: (fn: typeof renderer) => { renderer = fn; },
+    /** Serialized context of the primary agent. */
+    context: (agent = 'agent') => JSON.stringify(framework.getAgent(agent)!.getContextManager().getAllMessages()),
+    /** Serialized last model request. */
+    lastRequest: () => JSON.stringify(membrane.calls.at(-1)),
+    turn: async () => { membrane.pushResponse(ok()); await framework.runUntilIdle(); },
+    /** Every subsequent model call gets a complete 'ok' response (multi-turn tests). */
+    alwaysRespond: () => {
+      (membrane as unknown as { streamYielding: unknown }).streamYielding = (request: unknown) => {
+        membrane.calls.push(request as never);
+        return new MockYieldingStream([ok()]);
+      };
+    },
+    close: async () => {
+      await framework.stop();
+      for (const client of wss.clients) client.terminate();
+      await new Promise<void>((r) => wss.close(() => r()));
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+async function eventually(predicate: () => boolean, what = 'condition'): Promise<void> {
+  const deadline = Date.now() + 3000;
+  while (!predicate()) { assert(Date.now() < deadline, `${what} did not settle`); await new Promise((r) => setTimeout(r, 10)); }
+}
+
+// ---------------------------------------------------------------------------
+// Plain coalescing, feature-set scope (vectors 1–6, 35)
+// ---------------------------------------------------------------------------
+
+test('host advertises eventCoalescing with the default retry window', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  assert.deepEqual(f.hostCaps[0].eventCoalescing, { pushEvents: true, channelsIncoming: true, deferred: true, channelScopedPush: true, retryWindowMs: 3_600_000 });
+});
+
+test('vectors 2, 6, 35: unread replacement keeps only the newest content; a retry returns the receipt', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const first = await f.send('push/event', f.params('1', 'edit_original', { initial: true }));
+  const second = await f.send('push/event', f.params('2', 'edit_middle'));
+  const last = await f.send('push/event', f.params('3', 'edit_latest'));
+  assert.equal(first.result.coalesce.outcome, 'first');
+  assert.equal(second.result.coalesce.outcome, 'replaced');
+  assert.deepEqual(last.result.coalesce, { outcome: 'replaced', priorEventId: '2' });
+  // In context immediately (not staged), but only the newest occurrence.
+  assert(f.context().includes('edit_latest'));
+  assert(!f.context().includes('edit_original') && !f.context().includes('edit_middle'));
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 1);
+  assert(f.lastRequest().includes('edit_latest') && !f.lastRequest().includes('edit_original'));
+  const retry = await f.send('push/event', f.params('3', 'edit_latest'));
+  assert.deepEqual(retry.result, last.result);
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 1, 'a retry has no second effect');
+});
+
+test('vector 3: a consumed occurrence is history; the next one appends', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', f.params('1', 'battery_79', { initial: true }));
+  await f.framework.runUntilIdle();
+  const r = await f.send('push/event', f.params('2', 'battery_78'));
+  assert.deepEqual(r.result.coalesce, { outcome: 'appended', priorEventId: '1' });
+  await f.turn();
+  const req = f.lastRequest();
+  assert(req.includes('battery_79') && req.includes('battery_78'));
+  assert(req.indexOf('battery_79') < req.indexOf('battery_78'));
+});
+
+test('vector 28: retraction of never-read content leaves no trace and no turn', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', f.params('1', 'unread_original', { initial: true }));
+  const r = await f.send('push/event', f.params('2', 'deletion_notice', { retract: true }));
+  assert.equal(r.result.coalesce.outcome, 'retracted');
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0);
+  assert(!f.context().includes('unread_original') && !f.context().includes('deletion_notice'));
+});
+
+test('vectors 29/34: read original → unread edit → delete keeps the original and appends only the notice', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', f.params('1', 'read_original', { initial: true }));
+  await f.framework.runUntilIdle();
+  const edit = await f.send('push/event', f.params('2', 'unread_edit'));
+  assert.equal(edit.result.coalesce.outcome, 'appended');
+  const del = await f.send('push/event', f.params('3', 'deletion_notice', { retract: true }));
+  assert.equal(del.result.coalesce.outcome, 'noted');
+  await f.turn();
+  const req = f.lastRequest();
+  assert(req.includes('read_original') && req.includes('deletion_notice') && !req.includes('unread_edit'));
+  // History persists past the empty slot: a new create under the same key, then delete → noted.
+  await f.send('push/event', f.params('4', 'new_create'));
+  const again = await f.send('push/event', f.params('5', 'second_notice', { retract: true }));
+  assert.equal(again.result.coalesce.outcome, 'noted');
+});
+
+test('vector 30/33: empty retraction of consumed content is "consumed" and appends nothing', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  await f.send('channels/incoming', { messages: [f.channel('c', 'presence_line', { initial: true }, 'chat', 'p1')] });
+  await f.framework.runUntilIdle();
+  const count = f.framework.getAgent('agent')!.getContextManager().getMessageCount();
+  const r = await f.send('push/event', { featureSet: 'doc', eventId: 'gone', timestamp: TS, coalesce: { channelId: 'chat', key: 'message:p1', retract: true }, payload: { content: [] } });
+  assert.equal(r.result.coalesce.outcome, 'consumed');
+  assert.equal(f.framework.getAgent('agent')!.getContextManager().getMessageCount(), count);
+});
+
+test('vectors 31/32/34a: history is unknown without `initial`; `initial` makes "retracted" reachable after a restart', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.framework.stop(); await f.create();
+  const plainCreate = await f.send('push/event', f.params('a', 'no_birth_marker', { key: 'k1' }));
+  assert.equal(plainCreate.result.coalesce.outcome, 'appended');
+  const plainDelete = await f.send('push/event', f.params('b', '[deleted]', { key: 'k1', retract: true }));
+  assert.equal(plainDelete.result.coalesce.outcome, 'noted', 'unknown history yields the notice');
+  const born = await f.send('push/event', f.params('c', 'born_here', { key: 'k2', initial: true }));
+  assert.equal(born.result.coalesce.outcome, 'first');
+  const gone = await f.send('push/event', f.params('d', '[deleted]', { key: 'k2', retract: true }));
+  assert.equal(gone.result.coalesce.outcome, 'retracted');
+  assert(!f.context().includes('born_here'));
+  // vector 34b: initial cannot lower history.
+  await f.send('push/event', f.params('e', 'seen', { key: 'k3', initial: true }));
+  await f.framework.runUntilIdle();
+  await f.send('push/event', f.params('f', 'again', { key: 'k3', initial: true }));
+  const later = await f.send('push/event', f.params('g', 'notice', { key: 'k3', retract: true }));
+  assert.equal(later.result.coalesce.outcome, 'noted');
+});
+
+test('vector 9: feature set and key isolate subjects', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', f.params('1', 'doc_a', { key: 'A', initial: true }));
+  await f.send('push/event', f.params('2', 'doc_b', { key: 'B', initial: true }));
+  const r = await f.send('push/event', f.params('3', 'doc_a2', { key: 'A' }));
+  assert.equal(r.result.coalesce.outcome, 'replaced');
+  assert(f.context().includes('doc_b') && f.context().includes('doc_a2') && !f.context().includes('doc_a"'));
+});
+
+test('vector 38: malformed coalesce is a -32602 on push/event and per-message on channels/incoming', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const bad = await f.send('push/event', f.params('1', 'x', { key: 'k'.repeat(257) }));
+  assert.equal(bad.error.code, -32602);
+  const both = await f.send('push/event', f.params('2', 'x', { deferred: true, retract: true }));
+  assert.equal(both.error.code, -32602);
+  const missing = { ...f.channel('bad', 'bad'), eventId: undefined };
+  const deferred = f.channel('bad2', 'bad2', { deferred: true });
+  const r = await f.send('channels/incoming', { messages: [missing, f.channel('good', 'good', { initial: true }), deferred] });
+  assert.deepEqual(r.result.results.map((x: { accepted: boolean }) => x.accepted), [false, true, false]);
+  assert.equal(r.result.results[0].reason, 'coalesce_invalid');
+  assert.equal(r.result.results[2].reason, 'coalesce_invalid');
+  await f.framework.runUntilIdle();
+  assert(f.lastRequest().includes('good'));
+});
+
+// ---------------------------------------------------------------------------
+// Channel scope, mixed lanes (vectors 8, 10, 13, 14, 15a, 43)
+// ---------------------------------------------------------------------------
+
+test('vector 10: channel create, push edit, push delete share one unread subject', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const first = await f.send('channels/incoming', { messages: [f.channel('c', 'chat_original', { initial: true })] });
+  const edit = await f.send('push/event', f.params('e', 'chat_edit', { channelId: 'chat', key: 'message:m' }));
+  const del = await f.send('push/event', f.params('d', 'chat_deleted', { channelId: 'chat', key: 'message:m', retract: true }));
+  assert.equal(first.result.results[0].coalesce.outcome, 'first');
+  assert.equal(edit.result.coalesce.outcome, 'replaced');
+  assert.equal(del.result.coalesce.outcome, 'retracted');
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0);
+  for (const text of ['chat_original', 'chat_edit', 'chat_deleted']) assert(!f.context().includes(text));
+});
+
+test('vector 8: repeated channel edits keep the platform message id and deduplicate a retried occurrence', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  await f.send('channels/incoming', { messages: [f.channel('c', 'original', { initial: true })] });
+  const edit = await f.send('channels/incoming', { messages: [f.channel('e', 'newest')] });
+  const retry = await f.send('channels/incoming', { messages: [f.channel('e', 'newest')] });
+  assert.deepEqual(retry.result, edit.result);
+  assert.equal(edit.result.results[0].coalesce.outcome, 'replaced');
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 1);
+  assert(f.lastRequest().includes('newest') && !f.lastRequest().includes('original'));
+  const stored = f.framework.getAgent('agent')!.getContextManager().getAllMessages().find((m) => m.metadata?.eventId === 'e');
+  assert.equal(stored?.metadata?.messageId, 'm');
+});
+
+test('vector 43: a mixed-lane edit keeps the stable reply target', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  await f.send('channels/incoming', { messages: [{ ...f.channel('c', 'first_version', { initial: true }), threadId: 'thread' }] });
+  await f.framework.runUntilIdle();
+  await f.send('push/event', { ...f.params('e', 'second_version', { channelId: 'chat', key: 'message:m' }), origin: { messageId: 'm', authorId: 'u', authorName: 'User', threadId: 'thread' } });
+  await f.turn();
+  assert.equal(f.published.at(-1)?.channelId, 'chat');
+});
+
+test('vectors 13/15: a channel-scoped push needs current channel authority and a declared channel', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const unknown = await f.send('push/event', f.params('1', 'text', { channelId: 'chat' }));
+  assert.equal(unknown.error.code, -32023);
+  // A channel id that only ever appeared in a push's origin is not declared.
+  await f.send('push/event', { featureSet: 'doc', eventId: 'dm', timestamp: TS, payload: { content: [{ type: 'text', text: 'dm' }] },
+    tags: ['chat:dm'], origin: { source: 'discord', channelId: '42', guildId: null, authorId: 'u', authorName: 'User' } });
+  await f.framework.runUntilIdle();
+  const forged = await f.send('push/event', f.params('2', 'text', { channelId: 'discord:dm:42' }));
+  assert.equal(forged.error.code, -32023);
+  await f.register();
+  const okNow = await f.send('push/event', f.params('3', 'text', { channelId: 'chat', initial: true }));
+  assert.equal(okNow.result.coalesce.outcome, 'first');
+});
+
+test('vector 14: scope is never inferred from origin', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register('chat:one');
+  await f.send('channels/incoming', { messages: [f.channel('a', 'channel_one', { initial: true }, 'chat:one')] });
+  await f.send('push/event', { ...f.params('feature', 'feature_scope', { key: 'message:m' }), origin: { channelId: 'chat:one' } });
+  await f.framework.runUntilIdle();
+  assert(f.lastRequest().includes('channel_one') && f.lastRequest().includes('feature_scope'));
+});
+
+test('vector 33 (channel lane): an ordinary channels/incoming message without coalesce is unchanged', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const r = await f.send('channels/incoming', { messages: [{ channelId: 'chat', messageId: 'p', timestamp: TS, author: { id: 'u', name: 'User' }, content: [{ type: 'text', text: 'plain' }] }] });
+  assert.deepEqual(r.result.results[0], { messageId: 'p', accepted: true });
+});
+
+// ---------------------------------------------------------------------------
+// Wake treatment (vectors 36, 43 rev-6 behavioural)
+// ---------------------------------------------------------------------------
+
+test('a retraction withdraws the unstarted wake its subject queued', async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => true } }); t.after(f.close);
+  const internals = f.framework as unknown as { pendingRequests: unknown[] };
+  await f.send('push/event', f.params('1', 'withdrawn', { initial: true }));
+  assert.equal(internals.pendingRequests.length, 1);
+  await f.send('push/event', f.params('2', 'gone', { retract: true }));
+  assert.equal(internals.pendingRequests.length, 0);
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0);
+});
+
+test('a replacement is evaluated by the gate as a fresh occurrence; a qualifying replacement wakes once', async (t) => {
+  const f = await fixture({ framework: { gate: { config: { policies: [{ name: 'attention', match: { tagsAny: ['doc:wake'] }, behavior: 'always' }], default: 'skip' } } } as never }); t.after(f.close);
+  const internals = f.framework as unknown as { pendingRequests: unknown[] };
+  await f.send('push/event', { ...f.params('1', 'quiet', { initial: true }), tags: ['doc:quiet'] });
+  assert.equal(internals.pendingRequests.length, 0);
+  await f.send('push/event', { ...f.params('2', 'loud', {}), tags: ['doc:wake'] });
+  assert.equal(internals.pendingRequests.length, 1);
+  await f.send('push/event', { ...f.params('3', 'louder', {}), tags: ['doc:wake'] });
+  assert.equal(internals.pendingRequests.length, 1, 'no second wake for the same subject');
+  await f.send('push/event', { ...f.params('4', 'quiet_again', {}), tags: ['doc:quiet'] });
+  assert.equal(internals.pendingRequests.length, 0, 'a non-qualifying replacement withdraws the wake');
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Deferred rendering (vectors 16–27)
+// ---------------------------------------------------------------------------
+
+test('vectors 16/17/18: notices render once at assembly with their private data; never the fallback', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', f.params('1', 'fallback_unavailable', { deferred: true, data: { private: 'hidden_notice' } }));
+  const joined = await f.send('push/event', f.params('2', 'fallback_unavailable', { deferred: true, data: { private: 'hidden_notice_2' } }));
+  assert.equal(joined.result.coalesce.outcome, 'replaced');
+  assert.equal(f.renders.length, 0);
+  assert(!f.context().includes('fallback_unavailable'), 'a batch is not model-visible');
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 1);
+  assert.equal(f.renders[0].notices ? (f.renders[0].notices as unknown[]).length : 0, 2);
+  assert.deepEqual((f.renders[0].notices as Array<{ data: unknown }>).map((n) => n.data), [{ private: 'hidden_notice' }, { private: 'hidden_notice_2' }]);
+  const req = f.lastRequest();
+  assert(req.includes('document_diff') && !req.includes('fallback_unavailable') && !req.includes('hidden_notice'));
+  // vector 18: a second inference issues no render; vector 19: a new notice does.
+  await f.turn();
+  assert.equal(f.renders.length, 1);
+  const again = await f.send('push/event', f.params('3', 'fallback', { deferred: true }));
+  assert.equal(again.result.coalesce.outcome, 'first');
+  await f.turn();
+  assert.equal(f.renders.length, 2);
+});
+
+test('vector 20: an empty render appends nothing', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.renderer(async () => ({ content: [] }));
+  await f.send('push/event', f.params('1', 'fallback', { deferred: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 1);
+  assert(!f.lastRequest().includes('fallback'));
+});
+
+test('vectors 21/23: a render past the deadline materializes the fallback; the late result is discarded', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.renderer(async () => { await new Promise((r) => setTimeout(r, 5300)); return { content: [{ type: 'text', text: 'wire_late_payload' }] }; });
+  await f.send('push/event', f.params('1', 'bounded_fallback', { deferred: true }));
+  await f.framework.runUntilIdle();
+  assert(f.lastRequest().includes('bounded_fallback') && !f.lastRequest().includes('wire_late_payload'));
+  await new Promise((r) => setTimeout(r, 400));
+  assert(!f.context().includes('wire_late_payload'));
+});
+
+test('vector 21: a render error uses the fallback', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.renderer(async () => ({ content: [null] }));
+  await f.send('push/event', f.params('1', 'fallback_text', { deferred: true }));
+  await f.framework.runUntilIdle();
+  assert(f.lastRequest().includes('fallback_text'));
+});
+
+test('vector 26: inference/request during push/render is refused', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  let refused: unknown;
+  f.renderer(async () => { refused = (await f.send('inference/request', { featureSet: 'doc', messages: [] })).error?.code; return { content: [{ type: 'text', text: 'rendered' }] }; });
+  await f.send('push/event', f.params('1', 'fallback', { deferred: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(refused, -32600);
+});
+
+test('vectors 27a/27c: retract or plain replacement during a render cancels the frozen batch', async (t) => {
+  for (const operation of ['retract', 'plain'] as const) {
+    const f = await fixture();
+    try {
+      let release!: (value: unknown) => void;
+      let began!: () => void;
+      const started = new Promise<void>((resolve) => { began = resolve; });
+      f.renderer(() => { began(); return new Promise((resolve) => { release = resolve; }); });
+      await f.send('push/event', f.params('1', 'fallback_one', { deferred: true, initial: true }));
+      const run = f.framework.runUntilIdle();
+      await started;
+      const r = await f.send('push/event', operation === 'retract'
+        ? f.params('2', 'deletion_notice', { retract: true })
+        : f.params('2', 'complete_snapshot'));
+      assert.equal(r.result.coalesce.outcome, operation === 'retract' ? 'retracted' : 'replaced');
+      // The plain replacement arrived while the turn was alive: it lands at
+      // the turn boundary and wakes the agent again, so a second turn follows.
+      if (operation === 'plain') f.alwaysRespond();
+      release({ content: [{ type: 'text', text: 'late_old_render' }] });
+      await run;
+      const req = f.lastRequest();
+      assert(!req.includes('late_old_render') && !req.includes('fallback_one') && !req.includes('deletion_notice'));
+      if (operation === 'plain') assert(req.includes('complete_snapshot'));
+    } finally { await f.close(); }
+  }
+});
+
+test('vector 24: revoked authority before assembly drops the batch without a render', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', f.params('1', 'previously_permitted', { deferred: true }));
+  await f.framework.stop(); await f.create(false);
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 0);
+  assert(!f.context().includes('previously_permitted'));
+});
+
+test('vector 27i: a deferred notice displaces an unread plain occurrence', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', f.params('1', 'plain_unread', { initial: true }));
+  const r = await f.send('push/event', f.params('2', 'fallback', { deferred: true }));
+  assert.equal(r.result.coalesce.outcome, 'replaced');
+  assert(!f.context().includes('plain_unread'));
+  await f.framework.runUntilIdle();
+  assert(f.lastRequest().includes('document_diff') && !f.lastRequest().includes('plain_unread'));
+});
+
+// ---------------------------------------------------------------------------
+// Recovery (vectors 7, 39, 40, 41, 47) and the findings from PR #196
+// ---------------------------------------------------------------------------
+
+test('vector 41 (#196 finding 1): a transient reconnect does not reject ordinary channel traffic', async (t) => {
+  const f = await fixture({ server: { reconnect: true, reconnectIntervalMs: 20 } }); t.after(f.close); await f.register();
+  const plain = (id: string) => ({ channelId: 'chat', messageId: id, timestamp: TS, author: { id: 'u', name: 'User' }, content: [{ type: 'text', text: 'plain_' + id }] });
+  const before = await f.send('channels/incoming', { messages: [plain('1')] });
+  f.disconnect();
+  await eventually(() => f.hostCaps.length === 2, 'reconnect');
+  await new Promise((r) => setTimeout(r, 100));
+  const after = await f.send('channels/incoming', { messages: [plain('2')] });
+  assert.equal(before.result.results[0].accepted, true);
+  assert.equal(after.result.results[0].accepted, true);
+});
+
+test('vector 39/40: a reconnect keeps accepted content and answers a retry with its receipt', async (t) => {
+  const f = await fixture({ server: { reconnect: true, reconnectIntervalMs: 20 } }); t.after(f.close); await f.register();
+  const params = { messages: [f.channel('c', 'survives_disconnect', { initial: true })] };
+  const accepted = await f.send('channels/incoming', params);
+  f.disconnect();
+  await eventually(() => f.hostCaps.length === 2, 'reconnect');
+  await f.register();
+  const retry = await f.send('channels/incoming', params);
+  assert.deepEqual(retry.result, accepted.result);
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 1);
+  const req = f.lastRequest();
+  assert.equal(req.split('survives_disconnect').length - 1, 1, 'exactly once');
+});
+
+test('vectors 7/47: restart keeps accepted content, receipts, and appends after it', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const params = f.params('once', 'exactly_once', { initial: true });
+  const original = await f.send('push/event', params);
+  await f.framework.stop(); await f.create();
+  const retry = await f.send('push/event', params);
+  assert.deepEqual(retry.result, original.result);
+  const next = await f.send('push/event', f.params('two', 'after_restart'));
+  assert.equal(next.result.coalesce.outcome, 'appended');
+  await f.framework.runUntilIdle();
+  const req = f.lastRequest();
+  assert(req.includes('exactly_once') && req.includes('after_restart'));
+  assert.equal(req.split('exactly_once').length - 1, 1);
+});
+
+test('#196 finding 2 / vector 34c: a busy channel never hits a subject cap', async (t) => {
+  const f = await fixture({ framework: { gate: { config: { policies: [{ name: 'attention', match: { tagsAny: ['chat:mention'] }, behavior: 'always' }], default: 'skip' } } } as never }); t.after(f.close); await f.register();
+  const msg = (i: number | string, tags: string[]) => ({ channelId: 'chat', messageId: 'm' + i, eventId: 'e' + i, timestamp: TS, author: { id: 'u', name: 'User' }, tags,
+    content: [{ type: 'text', text: 'text_' + i }], coalesce: { key: 'message:m' + i, initial: true } });
+  const t0 = Date.now();
+  for (let i = 0; i < 300; i++) {
+    const r = await f.send('channels/incoming', { messages: [msg(i, [])] });
+    assert.equal(r.result.results[0].accepted, true);
+  }
+  const elapsed = Date.now() - t0;
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0);
+  const mention = await f.send('channels/incoming', { messages: [msg('mention', ['chat:mention'])] });
+  assert.equal(mention.result.results[0].accepted, true);
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 1);
+  assert(f.lastRequest().includes('text_mention') && f.lastRequest().includes('text_0'));
+  assert(elapsed < 6000, `300 coalesced messages took ${elapsed}ms`);
+});
+
+test('#196 finding 4: a context-budget restart does not assemble a pending batch', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', f.params('1', 'pending_batch', { deferred: true }));
+  const internals = f.framework as unknown as { startAgentStream(a: unknown, t: unknown): Promise<void>; pendingRequests: unknown[] };
+  internals.pendingRequests.length = 0;
+  await internals.startAgentStream(f.framework.getAgent('agent'), { agentName: 'agent', reason: 'context_budget_restart', source: 'probe', timestamp: Date.now() });
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 0, 'not rendered mid-logical-turn');
+  assert(!f.lastRequest().includes('document_diff'));
+  const joined = await f.send('push/event', f.params('2', 'pending_batch', { deferred: true }));
+  assert.equal(joined.result.coalesce.outcome, 'replaced', 'the batch survived the restart turn');
+  await f.turn();
+  assert.equal(f.renders.length, 1, 'rendered at the next fresh turn');
+  assert.equal((f.renders[0].notices as unknown[]).length, 2);
+});
+
+test('#196 finding 5: undo of a turn keeps the coalesced input that preceded it', async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => true } }); t.after(f.close);
+  await f.send('push/event', f.params('a', 'turn_one', { key: 'a', initial: true }));
+  await f.framework.runUntilIdle();
+  await f.send('push/event', f.params('b', 'unread_before_undo', { key: 'b', initial: true }));
+  await f.turn();
+  assert(f.lastRequest().includes('unread_before_undo'));
+  f.framework.undoLastTurn('agent');
+  assert(f.context().includes('unread_before_undo'), 'the input survives the undo of the turn that read it');
+  const r = await f.send('push/event', f.params('c', 'after_undo', { key: 'b' }));
+  assert.equal(r.result.coalesce.outcome, 'appended', 'after a branch switch nothing is replaceable');
+});
+
+test('a replacement while a turn is alive edits the deferred queue, not the live turn', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const internals = f.framework as unknown as { activeTurnTokens: Map<string, number>; deferredMessages: unknown[] };
+  internals.activeTurnTokens.set('agent', 100);
+  await f.send('push/event', f.params('1', 'queued_original', { initial: true }));
+  const r = await f.send('push/event', f.params('2', 'queued_replacement'));
+  assert.equal(r.result.coalesce.outcome, 'replaced');
+  assert.equal(internals.deferredMessages.length, 1);
+  assert(!f.context().includes('queued_original') && !f.context().includes('queued_replacement'));
+  internals.activeTurnTokens.delete('agent');
+  await f.turn();
+  assert(f.lastRequest().includes('queued_replacement') && !f.lastRequest().includes('queued_original'));
+});
+
+test('compression consumes: a message folded into a summary is no longer replaceable', async (t) => {
+  const { AutobiographicalStrategy } = await import('@animalabs/context-manager');
+  const strategy = new AutobiographicalStrategy({
+    adaptiveResolution: true, foldingStrategy: 'kv-stable', recentWindowTokens: 1_000, targetChunkTokens: 300,
+    kvStableReachTokens: 300, autoTickOnNewMessage: false, compressionModel: 'summarizer',
+  } as never);
+  const f = await fixture({ agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', strategy }] }); t.after(f.close);
+  (f.membrane as unknown as { complete: unknown }).complete = async (req: unknown) => { f.membrane.calls.push(req as never); return createMockResponse([{ type: 'text', text: 'SUMMARY' }]); };
+  await f.send('push/event', f.params('1', 'folded_original', { initial: true }));
+  const cm = f.framework.getAgent('agent')!.getContextManager();
+  for (let i = 0; i < 30; i++) cm.addMessage('user', [{ type: 'text', text: `filler_${i} ` + 'lorem ipsum '.repeat(40) }]);
+  for (let i = 0; i < 12; i++) await cm.tick();
+  assert(cm.getMaxSummaryLevel() > 0, 'folding happened');
+  const r = await f.send('push/event', f.params('2', 'after_fold'));
+  assert.equal(r.result.coalesce.outcome, 'appended');
+  assert(f.context().includes('folded_original') && f.context().includes('after_fold'));
+});
+
+test('conversation forks: a channel-scoped edit follows the routed fork and pins its reply channel', async (t) => {
+  const f = await fixture({ framework: { conversations: { templateAgent: 'agent', bind: { channel: 'always' }, trigger: { channel: 'always' } } } as never }); t.after(f.close); await f.register();
+  await f.send('channels/incoming', { messages: [f.channel('c', 'fork_original', { initial: true })] });
+  const edit = await f.send('push/event', f.params('e', 'fork_latest', { channelId: 'chat', key: 'message:m' }));
+  assert.equal(edit.result.coalesce.outcome, 'replaced');
+  f.alwaysRespond();
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 1);
+  assert(f.lastRequest().includes('fork_latest') && !f.lastRequest().includes('fork_original'));
+  assert(!f.context().includes('fork_latest'), 'the trunk never sees channel traffic');
+  assert.equal(f.published.at(-1)?.channelId, 'chat');
+});

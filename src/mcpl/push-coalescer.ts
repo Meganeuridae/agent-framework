@@ -1,0 +1,517 @@
+/**
+ * RFC-006 event coalescing (mcpl PR #5, revision 7): replace-if-unread, deferred
+ * rendering, and atomic retraction, for both delivery lanes.
+ *
+ * The design keeps content IN context. A plain occurrence is delivered through
+ * the ordinary channel/push path the moment it is admitted, exactly as today;
+ * the coalescer only remembers WHERE it landed. A later occurrence of the same
+ * subject edits or removes that message in place while it is still unread
+ * (above the agent's consumed watermark, not folded by compression), and
+ * appends once it has been read. Nothing is staged, journaled or capped: on
+ * any uncertainty (restart, branch switch, eviction) the host behaves as an
+ * append-only host would, which is what the RFC's principle 4 asks for.
+ *
+ * Only deferred batches (§5) wait outside context, because a notice has no
+ * model-visible content until `push/render` produces it.
+ *
+ * All host effects go through {@link CoalescerHost}; this class is pure
+ * bookkeeping and is unit-tested without a framework.
+ */
+import type { McplContentBlock, PushEventResult } from './types.js';
+
+export const PUSH_COALESCING_SUPPORT = {
+  pushEvents: true, channelsIncoming: true, deferred: true, channelScopedPush: true,
+  retryWindowMs: 3_600_000,
+} as const;
+
+export const COALESCE_OUTCOMES = ['first', 'replaced', 'appended', 'retracted', 'noted', 'consumed'] as const;
+export type CoalesceOutcome = typeof COALESCE_OUTCOMES[number];
+
+export class CoalesceError extends Error {
+  constructor(readonly field: string, message: string, readonly code = -32602) {
+    super(message);
+    this.name = 'CoalesceError';
+  }
+}
+
+/** Where an unread occurrence currently lives. */
+export interface CoalescingPlacement {
+  agent: string;
+  /** Stored message id in that agent's context manager. */
+  messageId?: string;
+  /** Entry id in the framework's deferred-write queue (turn-alive deferral). */
+  deferredId?: string;
+}
+
+export interface CoalescingScope { kind: 'featureSet' | 'channel'; id: string }
+
+/** One admitted occurrence, normalized from either lane. */
+export interface CoalescedOccurrence<E = unknown> {
+  serverId: string;
+  scope: CoalescingScope;
+  key: string;
+  eventId: string;
+  timestamp: string;
+  retract: boolean;
+  deferred: boolean;
+  initial: boolean;
+  data?: unknown;
+  tags?: string[];
+  /** Wire content (fallback for deferred; the notice for retract). */
+  content: McplContentBlock[];
+  /** Stable platform identity for channel subjects (§3.1). */
+  identity?: { messageId?: string; author?: { id: string; name: string }; threadId?: string };
+  /** The event the ordinary path would have queued — the host delivers it. */
+  event: E;
+}
+
+export interface DeferredNotice { eventId: string; timestamp: string; data?: unknown }
+
+export interface PushRenderParams {
+  featureSet: string;
+  channelId?: string;
+  key: string;
+  eventId: string;
+  notices: DeferredNotice[];
+  dropped: number;
+}
+export interface PushRenderResult { content: McplContentBlock[]; timestamp?: string }
+
+interface DeferredBatch<E> {
+  /** Latest notice; its content is the fallback, its tags/event drive delivery. */
+  latest: CoalescedOccurrence<E>;
+  notices: DeferredNotice[];
+  dropped: number;
+  /** Set on a batch restored from a snapshot whose render may have started. */
+  noRender?: boolean;
+}
+
+interface Rendering<E> {
+  batch: DeferredBatch<E>;
+  cancelled: boolean;
+  done: Promise<void>;
+}
+
+interface SubjectState<E> {
+  history: 'none' | 'some' | 'unknown';
+  occupant?: { eventId: string; placement: CoalescingPlacement };
+  batch?: DeferredBatch<E>;
+  rendering?: Rendering<E>;
+  consumedEventId?: string;
+  identity?: CoalescedOccurrence['identity'];
+  touchedAt: number;
+}
+
+export interface CoalescingSnapshot {
+  version: 1;
+  receipts: Array<[string, { result: PushEventResult; at: number }]>;
+  subjects: Array<{
+    subject: string;
+    history: SubjectState<unknown>['history'];
+    consumedEventId?: string;
+    identity?: CoalescedOccurrence['identity'];
+    occupant?: { eventId: string; placement: CoalescingPlacement };
+    batch?: { latest: CoalescedOccurrence<unknown>; notices: DeferredNotice[]; dropped: number };
+  }>;
+}
+
+export interface CoalescerHost<E> {
+  /** True iff the placement still exists and no model request has included it. */
+  isUnread(placement: CoalescingPlacement): boolean;
+  remove(placement: CoalescingPlacement): void;
+  /** Ordinary delivery of the event; undefined when routing delivered nowhere.
+   *  A replacement is delivered as a fresh message after the unread prior was
+   *  removed: it lands where a fresh event lands (§4.1 allows either place). */
+  deliver(occurrence: CoalescedOccurrence<E>, materialized?: McplContentBlock[], assemblingFor?: string): Promise<CoalescingPlacement | undefined>;
+  /** Queue a wake for a batch that has no model-visible content yet. */
+  wakeForBatch(occurrence: CoalescedOccurrence<E>): void;
+  /** Withdraw unstarted wakes whose sole cause is this subject. */
+  cancelWake(subject: string): void;
+  /** The batch's audience still holds the authority it was admitted under. */
+  authorized(occurrence: CoalescedOccurrence<E>): boolean;
+  /** Agents that read this occurrence's delivery target. */
+  audience(occurrence: CoalescedOccurrence<E>): string[];
+  render(occurrence: CoalescedOccurrence<E>, params: PushRenderParams): Promise<PushRenderResult>;
+  audit(record: Record<string, unknown>): void;
+  /** Persist (throttled by the host); the thunk builds the snapshot lazily. */
+  save(snapshot: () => CoalescingSnapshot): void;
+  now?(): number;
+}
+
+export interface CoalescerOptions {
+  retryWindowMs?: number;
+  maxSubjects?: number;
+  maxNotices?: number;
+  maxContentBytes?: number;
+  maxDataBytes?: number;
+}
+
+export function coalescingSubjectKey(serverId: string, scope: CoalescingScope, key: string): string {
+  return JSON.stringify([serverId, scope.kind, scope.id, key]);
+}
+
+/** Validate wire content before it is stored, rendered or converted. */
+export function validateCoalescedContent(content: unknown, maxBytes = 1024 * 1024): asserts content is McplContentBlock[] {
+  if (!Array.isArray(content)) throw new CoalesceError('payload.content', 'content must be an array');
+  for (const b of content as Array<Record<string, unknown>>) {
+    if (!b || typeof b !== 'object' || Array.isArray(b)) throw new CoalesceError('payload.content', 'invalid content block');
+    if (b.type === 'text' && typeof b.text === 'string') continue;
+    if (b.type === 'resource' && typeof b.uri === 'string') continue;
+    if ((b.type === 'image' || b.type === 'audio')
+      && (typeof b.uri === 'string' || (typeof b.data === 'string' && typeof b.mimeType === 'string'))) continue;
+    throw new CoalesceError('payload.content', 'invalid content block');
+  }
+  if (Buffer.byteLength(JSON.stringify(content)) > maxBytes) throw new CoalesceError('payload.content', 'content exceeds host byte limit');
+}
+
+/** Validate the `coalesce` member of either lane (§13). */
+export function validateCoalesceMember(
+  c: unknown,
+  lane: 'push' | 'channel',
+  maxDataBytes = 4096,
+): asserts c is NonNullable<import('./types.js').PushEventParams['coalesce']> {
+  if (!c || typeof c !== 'object' || Array.isArray(c)) throw new CoalesceError('coalesce', 'coalesce must be an object');
+  const m = c as Record<string, unknown>;
+  if (typeof m.key !== 'string' || !Buffer.byteLength(m.key) || Buffer.byteLength(m.key) > 256) {
+    throw new CoalesceError('coalesce.key', 'key must be 1..256 UTF-8 bytes');
+  }
+  for (const field of ['deferred', 'retract', 'initial'] as const) {
+    if (m[field] !== undefined && typeof m[field] !== 'boolean') throw new CoalesceError(`coalesce.${field}`, 'expected boolean');
+  }
+  if (m.channelId !== undefined && (typeof m.channelId !== 'string' || !m.channelId)) {
+    throw new CoalesceError('coalesce.channelId', 'channelId must be a non-empty string');
+  }
+  if (lane === 'channel' && ('channelId' in m || 'deferred' in m)) {
+    throw new CoalesceError('coalesce', 'channel messages cannot select scope or deferred mode');
+  }
+  if (m.deferred && m.retract) throw new CoalesceError('coalesce', 'deferred and retract are exclusive');
+  if (m.initial && m.retract) throw new CoalesceError('coalesce', 'initial and retract are exclusive');
+  if (m.data !== undefined && !m.deferred) throw new CoalesceError('coalesce.data', 'data requires deferred');
+  if (m.data !== undefined && Buffer.byteLength(JSON.stringify(m.data)) > maxDataBytes) {
+    throw new CoalesceError('coalesce.data', `data exceeds ${maxDataBytes} bytes`);
+  }
+}
+
+export class PushCoalescer<E = unknown> {
+  private readonly subjects = new Map<string, SubjectState<E>>();
+  private readonly receipts = new Map<string, { result: PushEventResult; at: number }>();
+  private readonly retryWindowMs: number;
+  private readonly maxSubjects: number;
+  private readonly maxNotices: number;
+  private suspended = false;
+
+  constructor(private readonly host: CoalescerHost<E>, private readonly options: CoalescerOptions = {}) {
+    this.retryWindowMs = options.retryWindowMs ?? PUSH_COALESCING_SUPPORT.retryWindowMs;
+    this.maxSubjects = options.maxSubjects ?? 4_096;
+    this.maxNotices = options.maxNotices ?? 64;
+  }
+
+  private now(): number { return this.host.now?.() ?? Date.now(); }
+
+  // ---------------------------------------------------------------------------
+  // Observation
+  // ---------------------------------------------------------------------------
+
+  /** The unread occupant's or batch's placement/identity, for routing continuity. */
+  identity(subject: string): CoalescedOccurrence['identity'] | undefined {
+    return this.subjects.get(subject)?.identity;
+  }
+
+  pendingBatches(): number {
+    let n = 0;
+    for (const s of this.subjects.values()) if (s.batch) n++;
+    return n;
+  }
+
+  /** §10.7: a server handling push/render must not issue inference/request. */
+  isRendering(serverId: string): boolean {
+    for (const s of this.subjects.values()) {
+      if (s.rendering && !s.rendering.cancelled && s.rendering.batch.latest.serverId === serverId) return true;
+    }
+    return false;
+  }
+
+  receipt(serverId: string, eventId: string): PushEventResult | undefined {
+    const entry = this.receipts.get(JSON.stringify([serverId, eventId]));
+    if (!entry) return undefined;
+    if (this.now() - entry.at > this.retryWindowMs) { this.receipts.delete(JSON.stringify([serverId, eventId])); return undefined; }
+    return structuredClone(entry.result);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Admission
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Admit an occurrence that has already passed the lane's ordinary checks and
+   * the coalesce-member validation. Returns the wire result, performing the
+   * host effects (replace / remove / deliver) synchronously so a create, edit
+   * and delete cannot overtake one another.
+   */
+  async accept(occurrence: CoalescedOccurrence<E>): Promise<PushEventResult> {
+    if (this.suspended) throw new CoalesceError('serverId', 'host is stopping', -32000);
+    const duplicate = this.receipt(occurrence.serverId, occurrence.eventId);
+    if (duplicate) return duplicate;
+    const subject = coalescingSubjectKey(occurrence.serverId, occurrence.scope, occurrence.key);
+    const state = this.subjectFor(subject, occurrence);
+    const occupantUnread = this.refreshOccupant(state);
+    const priorEventId = state.occupant?.eventId ?? state.batch?.latest.eventId ?? state.rendering?.batch.latest.eventId ?? state.consumedEventId;
+    this.host.audit({ kind: 'received', subject, eventId: occurrence.eventId, retract: occurrence.retract, deferred: occurrence.deferred });
+
+    let outcome: CoalesceOutcome;
+    if (occurrence.retract) {
+      outcome = await this.retract(subject, state, occurrence, occupantUnread);
+    } else if (occurrence.deferred) {
+      outcome = this.acceptDeferred(subject, state, occurrence, occupantUnread);
+    } else {
+      outcome = await this.acceptPlain(subject, state, occurrence, occupantUnread);
+    }
+    if (occurrence.scope.kind === 'channel' && occurrence.identity && !occurrence.retract) {
+      state.identity = { ...state.identity, ...occurrence.identity };
+    }
+    state.touchedAt = this.now();
+    const result: PushEventResult = { accepted: true, coalesce: { outcome, ...(priorEventId ? { priorEventId } : {}) } };
+    this.receipts.set(JSON.stringify([occurrence.serverId, occurrence.eventId]), { result: structuredClone(result), at: this.now() });
+    this.prune();
+    this.persist();
+    return structuredClone(result);
+  }
+
+  private subjectFor(subject: string, occurrence: CoalescedOccurrence<E>): SubjectState<E> {
+    let state = this.subjects.get(subject);
+    if (!state) {
+      // §3.3: an untracked subject is `unknown` unless the producer marks the
+      // birth of the subject. A retraction is never a birth.
+      state = { history: occurrence.initial && !occurrence.retract ? 'none' : 'unknown', touchedAt: this.now() };
+      this.subjects.set(subject, state);
+    }
+    return state;
+  }
+
+  /** Re-check the occupant against the host: consumed occupants become history. */
+  private refreshOccupant(state: SubjectState<E>): boolean {
+    if (!state.occupant) return false;
+    if (this.host.isUnread(state.occupant.placement)) return true;
+    state.history = 'some';
+    state.consumedEventId = state.occupant.eventId;
+    state.occupant = undefined;
+    return false;
+  }
+
+  private dropBatches(subject: string, state: SubjectState<E>): boolean {
+    let dropped = false;
+    if (state.batch) { this.host.audit({ kind: 'displaced', subject, eventId: state.batch.latest.eventId, batch: true }); state.batch = undefined; dropped = true; }
+    if (state.rendering) {
+      this.host.audit({ kind: 'render-cancelled', subject, eventId: state.rendering.batch.latest.eventId });
+      state.rendering.cancelled = true;
+      state.rendering = undefined;
+      dropped = true;
+    }
+    return dropped;
+  }
+
+  private async retract(subject: string, state: SubjectState<E>, occurrence: CoalescedOccurrence<E>, occupantUnread: boolean): Promise<CoalesceOutcome> {
+    if (occupantUnread && state.occupant) {
+      this.host.audit({ kind: 'removed', subject, eventId: state.occupant.eventId });
+      this.host.remove(state.occupant.placement);
+    }
+    state.occupant = undefined;
+    this.dropBatches(subject, state);
+    this.host.cancelWake(subject);
+    state.consumedEventId = undefined;
+    if (state.history === 'none') return 'retracted';
+    if (!occurrence.content.length) return 'consumed';
+    // The notice is an ordinary occurrence: it rides the normal delivery path
+    // (tags → gate policy → wake) and is consumed like any message.
+    const placement = await this.host.deliver(occurrence);
+    if (placement) {
+      state.occupant = { eventId: occurrence.eventId, placement };
+    }
+    return 'noted';
+  }
+
+  private async acceptPlain(subject: string, state: SubjectState<E>, occurrence: CoalescedOccurrence<E>, occupantUnread: boolean): Promise<CoalesceOutcome> {
+    const hadBatch = this.dropBatches(subject, state);
+    if (occupantUnread && state.occupant) {
+      const prior = state.occupant;
+      this.host.audit({ kind: 'displaced', subject, eventId: prior.eventId });
+      this.host.remove(prior.placement);
+      this.host.cancelWake(subject);
+      const placement = await this.host.deliver(occurrence);
+      state.occupant = placement ? { eventId: occurrence.eventId, placement } : undefined;
+      return 'replaced';
+    }
+    if (hadBatch) this.host.cancelWake(subject);
+    const placement = await this.host.deliver(occurrence);
+    state.occupant = placement ? { eventId: occurrence.eventId, placement } : undefined;
+    if (hadBatch) return 'replaced';
+    return state.consumedEventId || state.history !== 'none' ? 'appended' : 'first';
+  }
+
+  private acceptDeferred(subject: string, state: SubjectState<E>, occurrence: CoalescedOccurrence<E>, occupantUnread: boolean): CoalesceOutcome {
+    let outcome: CoalesceOutcome = 'first';
+    if (occupantUnread && state.occupant) {
+      // §5.1: a notice displaces an unread plain occurrence and opens a batch.
+      this.host.audit({ kind: 'displaced', subject, eventId: state.occupant.eventId });
+      this.host.remove(state.occupant.placement);
+      this.host.cancelWake(subject);
+      state.occupant = undefined;
+      outcome = 'replaced';
+    }
+    const notice: DeferredNotice = { eventId: occurrence.eventId, timestamp: occurrence.timestamp, ...(occurrence.data !== undefined ? { data: structuredClone(occurrence.data) } : {}) };
+    if (state.batch) {
+      state.batch.notices.push(notice);
+      if (state.batch.notices.length > this.maxNotices) { state.batch.notices.shift(); state.batch.dropped++; }
+      state.batch.latest = occurrence;
+      outcome = 'replaced';
+    } else {
+      // Rule 1: a notice during a render opens a NEW batch ("first").
+      state.batch = { latest: occurrence, notices: [notice], dropped: 0 };
+    }
+    this.host.wakeForBatch(occurrence);
+    return outcome;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Assembly (deferred batches only — plain content is already in context)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Render and materialize every pending batch whose audience includes
+   * `agentName`. Called by the host at a turn's assembly boundary, before the
+   * compile. Bounded by the host's render timeout; a failed or late render
+   * materializes the admitted fallback (§5.3).
+   */
+  async assemble(agentName: string): Promise<void> {
+    if (this.suspended) return;
+    const work: Promise<void>[] = [];
+    for (const [subject, state] of this.subjects) {
+      if (state.rendering) {
+        // Another assembly froze this batch; share its outcome (vector 25).
+        if (this.host.audience(state.rendering.batch.latest).includes(agentName)) work.push(state.rendering.done);
+        continue;
+      }
+      const batch = state.batch;
+      if (!batch || !this.host.audience(batch.latest).includes(agentName)) continue;
+      state.batch = undefined;
+      this.host.cancelWake(subject);
+      if (!this.host.authorized(batch.latest)) {
+        this.host.audit({ kind: 'revoked', subject, eventId: batch.latest.eventId });
+        continue;
+      }
+      const rendering: Rendering<E> = { batch, cancelled: false, done: Promise.resolve() };
+      state.rendering = rendering;
+      rendering.done = this.render(subject, state, rendering, agentName).finally(() => {
+        if (state.rendering === rendering) state.rendering = undefined;
+      });
+      work.push(rendering.done);
+    }
+    await Promise.all(work);
+    this.persist();
+  }
+
+  private async render(subject: string, state: SubjectState<E>, rendering: Rendering<E>, assemblingFor: string): Promise<void> {
+    const { batch } = rendering;
+    const occurrence = batch.latest;
+    let content: McplContentBlock[] = occurrence.content;
+    let timestamp = occurrence.timestamp;
+    let source: 'render' | 'fallback' = 'fallback';
+    if (!batch.noRender) {
+      const params: PushRenderParams = {
+        featureSet: (occurrence.event as { featureSet?: string } | undefined)?.featureSet ?? (occurrence.scope.kind === 'featureSet' ? occurrence.scope.id : ''),
+        ...(occurrence.scope.kind === 'channel' ? { channelId: occurrence.scope.id } : {}),
+        key: occurrence.key, eventId: occurrence.eventId,
+        notices: structuredClone(batch.notices), dropped: batch.dropped,
+      };
+      try {
+        const result = await this.host.render(occurrence, params);
+        if (rendering.cancelled) { this.host.audit({ kind: 'late-render', subject, eventId: occurrence.eventId, discarded: true }); return; }
+        validateCoalescedContent(result?.content, this.options.maxContentBytes);
+        content = result.content;
+        timestamp = typeof result.timestamp === 'string' ? result.timestamp : new Date().toISOString();
+        source = 'render';
+      } catch (error) {
+        if (rendering.cancelled) return;
+        this.host.audit({ kind: 'render-failed', subject, eventId: occurrence.eventId, error: String(error) });
+      }
+    }
+    if (rendering.cancelled) return;
+    // Rule 4: authority is re-checked at response.
+    if (!this.host.authorized(occurrence)) { this.host.audit({ kind: 'revoked', subject, eventId: occurrence.eventId }); return; }
+    this.host.audit({ kind: 'rendered', subject, eventId: occurrence.eventId, source, empty: content.length === 0 });
+    if (!content.length) return; // §5.2: nothing happened
+    // The materialized occurrence is consumed by the request being assembled.
+    await this.host.deliver({ ...occurrence, timestamp, content }, content, assemblingFor);
+    state.history = 'some';
+    state.consumedEventId = occurrence.eventId;
+    state.occupant = undefined;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Lifecycle
+  // ---------------------------------------------------------------------------
+
+  restore(snapshot: CoalescingSnapshot | null | undefined): void {
+    if (!snapshot || snapshot.version !== 1) return;
+    const now = this.now();
+    for (const [key, entry] of snapshot.receipts) {
+      if (now - entry.at <= this.retryWindowMs) this.receipts.set(key, entry);
+    }
+    for (const s of snapshot.subjects) {
+      const state: SubjectState<E> = {
+        // A stored occupant is in context and will be in the next request:
+        // it counts as read from here on (the watermark restarts at the head).
+        history: s.occupant ? 'some' : s.history,
+        consumedEventId: s.occupant?.eventId ?? s.consumedEventId,
+        identity: s.identity,
+        touchedAt: now,
+      };
+      if (s.batch) {
+        // An interrupted render is not replayed (§3.2): the batch keeps its
+        // fallback and materializes that at the next assembly.
+        state.batch = { latest: s.batch.latest as CoalescedOccurrence<E>, notices: s.batch.notices, dropped: s.batch.dropped, noRender: true };
+      }
+      this.subjects.set(s.subject, state);
+    }
+  }
+
+  snapshot(): CoalescingSnapshot {
+    return {
+      version: 1,
+      receipts: [...this.receipts],
+      subjects: [...this.subjects].map(([subject, s]) => ({
+        subject, history: s.history, consumedEventId: s.consumedEventId, identity: s.identity,
+        ...(s.occupant ? { occupant: s.occupant } : {}),
+        ...(s.batch ? { batch: { latest: s.batch.latest as CoalescedOccurrence<unknown>, notices: s.batch.notices, dropped: s.batch.dropped } }
+          : s.rendering ? { batch: { latest: s.rendering.batch.latest as CoalescedOccurrence<unknown>, notices: s.rendering.batch.notices, dropped: s.rendering.batch.dropped } }
+          : {}),
+      })),
+    };
+  }
+
+  /** Batches whose wake should be re-queued after a restart (their fallback is pending). */
+  pendingBatchOccurrences(): CoalescedOccurrence<E>[] {
+    return [...this.subjects.values()].flatMap(s => s.batch ? [s.batch.latest] : []);
+  }
+
+  suspend(): void {
+    this.suspended = true;
+    for (const [subject, state] of this.subjects) {
+      if (state.rendering) { state.rendering.cancelled = true; this.host.audit({ kind: 'render-cancelled', subject, eventId: state.rendering.batch.latest.eventId, reason: 'suspend' }); }
+    }
+  }
+
+  private persist(): void { this.host.save(() => this.snapshot()); }
+
+  private prune(): void {
+    const now = this.now();
+    if (this.receipts.size > 4 * this.maxSubjects) {
+      for (const [key, entry] of this.receipts) if (now - entry.at > this.retryWindowMs) this.receipts.delete(key);
+    }
+    if (this.subjects.size <= this.maxSubjects) return;
+    // Evict the oldest idle subjects; their history degrades to `unknown`
+    // (an untracked subject) which is the conservative outcome (§3.3).
+    const idle = [...this.subjects].filter(([, s]) => !s.occupant && !s.batch && !s.rendering).sort((a, b) => a[1].touchedAt - b[1].touchedAt);
+    for (const [key] of idle.slice(0, Math.max(0, this.subjects.size - this.maxSubjects))) this.subjects.delete(key);
+  }
+}
