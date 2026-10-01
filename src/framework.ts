@@ -6831,6 +6831,7 @@ export class AgentFramework {
     const metadata: Record<string, unknown> = {
       ...event.metadata,
       ...(event.eventId ? { eventId: event.eventId } : {}),
+      ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
       channelId: event.channelId,
       messageId: event.messageId,
       author: event.author,
@@ -7353,6 +7354,18 @@ export class AgentFramework {
         this.coalescingRecentReceipts.push(record);
         this.store.setStateJson(COALESCING_RECENT_ID, this.coalescingRecentReceipts);
       },
+      wasPublished: (occ) => {
+        // Boot-time only: the occurrence's durable delivery identity
+        // (subject + eventId in message metadata) in any agent's context.
+        const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
+        for (const agent of this.agents.values()) {
+          try {
+            if (agent.getContextManager().getAllMessages().some((m) =>
+              m.metadata?.coalescingSubject === subject && m.metadata?.eventId === occ.eventId)) return true;
+          } catch { /* a context that cannot be read cannot prove publication */ }
+        }
+        return false;
+      },
       saveNow: (snapshot) => {
         if (this.coalescingSaveTimer) { clearTimeout(this.coalescingSaveTimer); this.coalescingSaveTimer = null; }
         this.coalescingSnapshotDirty = null;
@@ -7732,6 +7745,7 @@ export class AgentFramework {
       eventId: event.eventId,
       triggered: event.triggerInference ?? false,
       ...(event.tags ? { tags: event.tags } : {}),
+      ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
     };
     // `origin.channelId` is the server-internal raw id (a bare Discord
     // snowflake) — unroutable as a locus and unresolvable by the agent. Store

@@ -133,10 +133,12 @@ export interface CoalescingReceiptRecord {
   subject: string;
   /** History the subject was created with, for a subject first seen by this receipt. */
   born?: SubjectState<unknown>['history'];
-  /** The pending batch after this acceptance (deferred lane): the accepted
-   *  work itself, so a crash before the snapshot flush cannot lose it while
-   *  keeping the receipt that suppresses its retry. */
-  batch?: { latest: CoalescedOccurrence<unknown>; notices: DeferredNotice[]; dropped: number };
+  /** The subject's pending batch AFTER this acceptance: the accepted work
+   *  itself (so a crash before the snapshot flush cannot lose it while keeping
+   *  the receipt that suppresses its retry), or `null` when the acceptance
+   *  left no batch — a retraction or plain replacement must be recoverable
+   *  too. Records replay in order, so the last one per subject wins. */
+  batch: { latest: CoalescedOccurrence<unknown>; notices: DeferredNotice[]; dropped: number } | null;
 }
 
 export interface CoalescerHost<E> {
@@ -166,6 +168,10 @@ export interface CoalescerHost<E> {
   /** Persist one receipt now, before the acceptance is acknowledged. Throws
    *  on failure, which fails the acceptance (the producer retries). */
   recordReceipt?(record: CoalescingReceiptRecord): void;
+  /** Recovery: was this occurrence's content already published into a
+   *  context (its durable delivery identity is found there)? Prevents a
+   *  completed render from being delivered again as fallback. */
+  wasPublished?(occurrence: CoalescedOccurrence<E>): boolean;
   now?(): number;
 }
 
@@ -318,7 +324,7 @@ export class PushCoalescer<E = unknown> {
     try {
       this.host.recordReceipt?.({
         key: receiptKey, ...structuredClone(entry), subject, ...(born ? { born } : {}),
-        ...(state.batch ? { batch: structuredClone({ latest: state.batch.latest as CoalescedOccurrence<unknown>, notices: state.batch.notices, dropped: state.batch.dropped }) } : {}),
+        batch: state.batch ? structuredClone({ latest: state.batch.latest as CoalescedOccurrence<unknown>, notices: state.batch.notices, dropped: state.batch.dropped }) : null,
       });
     } catch (error) {
       // Not acknowledged: the work would be lost while its receipt suppressed
@@ -574,6 +580,26 @@ export class PushCoalescer<E = unknown> {
       }
       this.subjects.set(s.subject, state);
     }
+    this.settlePublished();
+  }
+
+  /**
+   * A batch restored as RENDERING may already have been published (its
+   * result or fallback is a durable context message; only the completion
+   * snapshot was lost). Recovery then marks it consumed instead of
+   * delivering the fallback a second time.
+   */
+  private settlePublished(): void {
+    if (!this.host.wasPublished) return;
+    for (const state of this.subjects.values()) {
+      const batch = state.batch;
+      if (!batch?.noRender) continue;
+      if (this.host.wasPublished(batch.latest)) {
+        state.batch = undefined;
+        state.history = 'some';
+        state.consumedEventId = batch.latest.eventId;
+      }
+    }
   }
 
   /** Apply receipts written since the last snapshot (crash-window bridge). */
@@ -583,15 +609,19 @@ export class PushCoalescer<E = unknown> {
       if (now - r.at > this.retryWindowMs) continue;
       this.receipts.set(r.key, { result: r.result, at: r.at });
       if (r.born && !this.subjects.has(r.subject)) this.subjects.set(r.subject, { history: r.born, touchedAt: now });
-      if (r.batch) {
-        // The accepted deferred work itself, newer than the snapshot. It never
-        // began rendering before the record was written, but the snapshot
-        // cannot say whether it did afterwards: take the fallback.
-        const state = this.subjects.get(r.subject) ?? { history: 'unknown' as const, touchedAt: now };
-        state.batch = { latest: r.batch.latest as CoalescedOccurrence<E>, notices: r.batch.notices, dropped: r.batch.dropped, noRender: true };
-        this.subjects.set(r.subject, state);
-      }
+      if (r.batch === undefined) continue; // pre-round-3 record: no batch information
+      // The subject's batch AFTER that acceptance, newer than the snapshot:
+      // the accepted deferred work itself, or null for a withdrawal /
+      // replacement that cleared it. It never began rendering before the
+      // record was written, but the snapshot cannot say whether it did
+      // afterwards: take the fallback.
+      const state = this.subjects.get(r.subject) ?? { history: 'unknown' as const, touchedAt: now };
+      state.batch = r.batch
+        ? { latest: r.batch.latest as CoalescedOccurrence<E>, notices: r.batch.notices, dropped: r.batch.dropped, noRender: true }
+        : undefined;
+      this.subjects.set(r.subject, state);
     }
+    this.settlePublished();
   }
 
   snapshot(): CoalescingSnapshot {

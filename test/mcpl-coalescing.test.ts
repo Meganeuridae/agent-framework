@@ -803,3 +803,37 @@ test('R4: the render-start boundary is persisted before the RPC is issued', asyn
   await run;
   assert(f.lastRequest().includes('rendered'));
 });
+
+// ---------------------------------------------------------------------------
+// Review round 3 (#197): Codex on c03b23b — recovery from a mid-window image
+// ---------------------------------------------------------------------------
+
+test('R5: an acknowledged retraction is recoverable; a retry cannot resurrect the batch', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', f.params('1', 'withdrawn_fallback', { deferred: true, initial: true }));
+  const retract = f.params('2', 'notice', { retract: true });
+  const first = await f.send('push/event', retract);
+  assert.equal(first.result.coalesce.outcome, 'retracted');
+  await crash(f); await f.create();
+  const retry = await f.send('push/event', retract);
+  assert.deepEqual(retry.result, first.result);
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0);
+  assert(!f.context().includes('withdrawn_fallback') && !f.context().includes('notice'));
+});
+
+test('R6: a completed render is not delivered again as fallback after recovery', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', f.params('1', 'stale_fallback', { deferred: true }));
+  await f.framework.runUntilIdle();
+  assert(f.lastRequest().includes('document_diff'));
+  await crash(f); await f.create();
+  await f.framework.runUntilIdle();
+  const ctx = f.context();
+  assert.equal(ctx.split('document_diff').length - 1, 1, 'rendered content exactly once');
+  assert(!ctx.includes('stale_fallback'), 'no second delivery as fallback');
+  assert.equal(f.renders.length, 1);
+  // History is known: a retraction now appends the notice rather than withdrawing.
+  const r = await f.send('push/event', f.params('2', 'deleted_notice', { retract: true }));
+  assert.equal(r.result.coalesce.outcome, 'noted');
+});
