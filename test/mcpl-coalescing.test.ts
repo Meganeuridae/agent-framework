@@ -837,3 +837,20 @@ test('R6: a completed render is not delivered again as fallback after recovery',
   const r = await f.send('push/event', f.params('2', 'deleted_notice', { retract: true }));
   assert.equal(r.result.coalesce.outcome, 'noted');
 });
+
+test('R7: a read plain occurrence recovered from a mid-window image still gets its deletion notice', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', f.params('1', 'read_before_crash', { initial: true }));
+  await f.framework.runUntilIdle();
+  assert(f.lastRequest().includes('read_before_crash'));
+  await crash(f); await f.create();
+  const r = await f.send('push/event', f.params('2', 'deletion_notice_after_crash', { retract: true }));
+  assert.equal(r.result.coalesce.outcome, 'noted');
+  assert(f.context().includes('read_before_crash') && f.context().includes('deletion_notice_after_crash'));
+  // And the unread variant stays traceless: born, never read, crash, retract.
+  await f.send('push/event', f.params('3', 'never_read', { key: 'k2', initial: true }));
+  await crash(f); await f.create();
+  const r2 = await f.send('push/event', f.params('4', 'notice2', { key: 'k2', retract: true }));
+  assert.equal(r2.result.coalesce.outcome, 'noted', 'a stored occurrence counts as read after recovery (watermark at head)');
+  assert(f.context().includes('never_read') && f.context().includes('notice2'));
+});

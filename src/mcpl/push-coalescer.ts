@@ -168,10 +168,11 @@ export interface CoalescerHost<E> {
   /** Persist one receipt now, before the acceptance is acknowledged. Throws
    *  on failure, which fails the acceptance (the producer retries). */
   recordReceipt?(record: CoalescingReceiptRecord): void;
-  /** Recovery: was this occurrence's content already published into a
-   *  context (its durable delivery identity is found there)? Prevents a
-   *  completed render from being delivered again as fallback. */
-  wasPublished?(occurrence: CoalescedOccurrence<E>): boolean;
+  /** Recovery: is this occurrence's content in a context (its durable
+   *  delivery identity — subject + eventId in message metadata — is found
+   *  there)? A published occurrence is read from recovery on (the watermark
+   *  restarts at the head), whatever a stale record says about its history. */
+  wasPublished?(subject: string, eventId: string): boolean;
   now?(): number;
 }
 
@@ -591,10 +592,10 @@ export class PushCoalescer<E = unknown> {
    */
   private settlePublished(): void {
     if (!this.host.wasPublished) return;
-    for (const state of this.subjects.values()) {
+    for (const [subject, state] of this.subjects) {
       const batch = state.batch;
       if (!batch?.noRender) continue;
-      if (this.host.wasPublished(batch.latest)) {
+      if (this.host.wasPublished(subject, batch.latest.eventId)) {
         state.batch = undefined;
         state.history = 'some';
         state.consumedEventId = batch.latest.eventId;
@@ -609,6 +610,17 @@ export class PushCoalescer<E = unknown> {
       if (now - r.at > this.retryWindowMs) continue;
       this.receipts.set(r.key, { result: r.result, at: r.at });
       if (r.born && !this.subjects.has(r.subject)) this.subjects.set(r.subject, { history: r.born, touchedAt: now });
+      // A birth fact is not proof the subject is still unread: the plain
+      // occurrence this record acknowledged is in context (durable before the
+      // record) and counts as read from recovery on, like a snapshot occupant.
+      let eventId: string | undefined;
+      try { eventId = JSON.parse(r.key)[2]; } catch { /* malformed key: no settlement */ }
+      if (eventId && this.host.wasPublished?.(r.subject, eventId)) {
+        const state = this.subjects.get(r.subject) ?? { history: 'unknown' as const, touchedAt: now };
+        state.history = 'some';
+        state.consumedEventId = eventId;
+        this.subjects.set(r.subject, state);
+      }
       if (r.batch === undefined) continue; // pre-round-3 record: no batch information
       // The subject's batch AFTER that acceptance, newer than the snapshot:
       // the accepted deferred work itself, or null for a withdrawal /

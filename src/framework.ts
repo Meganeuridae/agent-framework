@@ -7354,14 +7354,13 @@ export class AgentFramework {
         this.coalescingRecentReceipts.push(record);
         this.store.setStateJson(COALESCING_RECENT_ID, this.coalescingRecentReceipts);
       },
-      wasPublished: (occ) => {
+      wasPublished: (subject, eventId) => {
         // Boot-time only: the occurrence's durable delivery identity
         // (subject + eventId in message metadata) in any agent's context.
-        const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
         for (const agent of this.agents.values()) {
           try {
             if (agent.getContextManager().getAllMessages().some((m) =>
-              m.metadata?.coalescingSubject === subject && m.metadata?.eventId === occ.eventId)) return true;
+              m.metadata?.coalescingSubject === subject && m.metadata?.eventId === eventId)) return true;
           } catch { /* a context that cannot be read cannot prove publication */ }
         }
         return false;
