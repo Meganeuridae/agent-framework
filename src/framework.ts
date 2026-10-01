@@ -7348,13 +7348,17 @@ export class AgentFramework {
       save: (snapshot) => this.scheduleCoalescingSnapshot(snapshot),
       recordReceipt: (record) => {
         // Written now, not at the throttled flush: an acknowledged acceptance
-        // must not lose its receipt (or the subject's birth) to a crash.
+        // must not lose its receipt, the subject's birth, or (deferred) the
+        // accepted work itself to a crash. A failure here fails the acceptance.
         this.coalescingRecentReceipts.push(record);
-        try {
-          this.store.setStateJson(COALESCING_RECENT_ID, this.coalescingRecentReceipts);
-        } catch (err) {
-          console.error('[coalescing] could not persist a receipt:', err);
-        }
+        this.store.setStateJson(COALESCING_RECENT_ID, this.coalescingRecentReceipts);
+      },
+      saveNow: (snapshot) => {
+        if (this.coalescingSaveTimer) { clearTimeout(this.coalescingSaveTimer); this.coalescingSaveTimer = null; }
+        this.coalescingSnapshotDirty = null;
+        this.store.setStateJson(COALESCING_STATE_ID, snapshot);
+        this.coalescingRecentReceipts = [];
+        this.store.setStateJson(COALESCING_RECENT_ID, []);
       },
     });
     try {
@@ -7482,6 +7486,10 @@ export class AgentFramework {
   private coalescedAuthorized(occ: CoalescedOccurrence<CoalescedDelivery>): boolean {
     const server = this.mcplServerRegistry?.getServer(occ.serverId);
     if (!server?.isConnected || !server.policyEstablished) return false;
+    // §3.2: work admitted under another binding (the id since reassigned to a
+    // different endpoint) never acquires the replacement peer's authority —
+    // and its private notice data is never sent to that peer.
+    if (occ.binding !== this.coalescingBinding(occ.serverId)) return false;
     if (occ.event.lane === 'push') {
       if (!server.grant.has('pushEvents')) return false;
       try { this.featureSetManager?.validateInbound(occ.serverId, occ.event.event.featureSet); } catch { return false; }

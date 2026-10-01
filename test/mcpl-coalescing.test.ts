@@ -736,3 +736,70 @@ test('G15: inference/request is refused while a cancelled render is still outsta
   assert.equal(refused, -32600);
   assert(!f.lastRequest().includes('late') && !f.lastRequest().includes('fallback'));
 });
+
+// ---------------------------------------------------------------------------
+// Review round 2 (#197): Codex R1–R4 on d86afc1
+// ---------------------------------------------------------------------------
+
+/** Simulate a crash: stop without the snapshot flush a clean stop performs. */
+async function crash(f: Awaited<ReturnType<typeof fixture>>): Promise<void> {
+  const internals = f.framework as unknown as { flushCoalescingSnapshot: () => void; coalescingSaveTimer: ReturnType<typeof setTimeout> | null };
+  if (internals.coalescingSaveTimer) clearTimeout(internals.coalescingSaveTimer);
+  internals.coalescingSaveTimer = null;
+  internals.flushCoalescingSnapshot = () => {};
+  await f.framework.stop();
+}
+
+test('R1: a deferred acceptance survives a crash before the snapshot flush, with its receipt', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const params = f.params('1', 'crash_fallback', { deferred: true, data: { k: 'v' } });
+  const original = await f.send('push/event', params);
+  await crash(f); await f.create();
+  const retry = await f.send('push/event', params);
+  assert.deepEqual(retry.result, original.result, 'the receipt survived');
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 1, 'the accepted work was delivered');
+  assert(f.lastRequest().includes('crash_fallback'), 'as its fallback: the host cannot prove no render started');
+  assert.equal(f.renders.length, 0);
+});
+
+test('R2: work admitted under a former binding never reaches the replacement endpoint', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', f.params('1', 'old_binding_fallback', { deferred: true, data: { secret: 'private_notice_data' } }));
+  const config = (f.framework as unknown as { mcplServerConfigs: Map<string, { url: string }> }).mcplServerConfigs.get('editor')!;
+  await f.framework.restartMcplServer('editor', { ...config, url: `${config.url}/reassigned` } as never);
+  await eventually(() => f.hostCaps.length === 2, 'reconnect to the new endpoint');
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 0, 'no push/render to the new peer');
+  assert(!JSON.stringify(f.renders).includes('private_notice_data'));
+  assert(!f.context().includes('old_binding_fallback'));
+});
+
+test('R3: a deferred notice displacing an unread plain occurrence stays in its fork', async (t) => {
+  const f = await fixture({ framework: { conversations: { templateAgent: 'agent', bind: { channel: 'always' }, trigger: { channel: 'always' } } } as never, server: { shouldTriggerInference: () => true } }); t.after(f.close); await f.register();
+  await f.send('channels/incoming', { messages: [f.channel('c', 'fork_plain', { initial: true })] });
+  const router = (f.framework as unknown as { conversationRouter: { getBinding(id: string): { agentName: string } | undefined; unbind(id: string): void } }).conversationRouter;
+  const g1 = router.getBinding('chat')!.agentName;
+  router.unbind('chat');
+  const r = await f.send('push/event', f.params('n', 'fallback', { deferred: true, channelId: 'chat', key: 'message:m' }));
+  assert.equal(r.result.coalesce.outcome, 'replaced');
+  f.alwaysRespond();
+  await f.framework.runUntilIdle();
+  assert.equal(router.getBinding('chat'), undefined, 'no fresh fork');
+  const g1ctx = JSON.stringify(f.framework.getAgent(g1)!.getContextManager().getAllMessages());
+  assert(g1ctx.includes('document_diff') && !g1ctx.includes('fork_plain'));
+});
+
+test('R4: the render-start boundary is persisted before the RPC is issued', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  let release!: (v: unknown) => void;
+  const started = new Promise<void>((resolve) => { f.renderer(() => { resolve(); return new Promise((r) => { release = r; }); }); });
+  await f.send('push/event', f.params('1', 'fallback', { deferred: true }));
+  const run = f.framework.runUntilIdle();
+  await started;
+  const store = (f.framework as unknown as { store: { getStateJson(id: string): { subjects: Array<{ batch?: { rendering?: boolean } }> } } }).store;
+  assert.equal(store.getStateJson('mcpl/coalescing').subjects[0]?.batch?.rendering, true, 'persisted as RENDERING while the RPC is outstanding');
+  release({ content: [{ type: 'text', text: 'rendered' }] });
+  await run;
+  assert(f.lastRequest().includes('rendered'));
+});

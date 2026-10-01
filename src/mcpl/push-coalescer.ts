@@ -133,6 +133,10 @@ export interface CoalescingReceiptRecord {
   subject: string;
   /** History the subject was created with, for a subject first seen by this receipt. */
   born?: SubjectState<unknown>['history'];
+  /** The pending batch after this acceptance (deferred lane): the accepted
+   *  work itself, so a crash before the snapshot flush cannot lose it while
+   *  keeping the receipt that suppresses its retry. */
+  batch?: { latest: CoalescedOccurrence<unknown>; notices: DeferredNotice[]; dropped: number };
 }
 
 export interface CoalescerHost<E> {
@@ -156,7 +160,11 @@ export interface CoalescerHost<E> {
   audit(record: Record<string, unknown>): void;
   /** Persist (throttled by the host); the thunk builds the snapshot lazily. */
   save(snapshot: () => CoalescingSnapshot): void;
-  /** Persist one receipt now, before the acceptance is acknowledged. */
+  /** Persist the snapshot NOW (a render is about to start: that boundary must
+   *  be recoverable before the RPC is issued, §3.2). Throws on failure. */
+  saveNow?(snapshot: CoalescingSnapshot): void;
+  /** Persist one receipt now, before the acceptance is acknowledged. Throws
+   *  on failure, which fails the acceptance (the producer retries). */
   recordReceipt?(record: CoalescingReceiptRecord): void;
   now?(): number;
 }
@@ -307,8 +315,18 @@ export class PushCoalescer<E = unknown> {
     const result: PushEventResult = { accepted: true, coalesce: { outcome, ...(priorEventId ? { priorEventId } : {}) } };
     const receiptKey = coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId);
     const entry = { result: structuredClone(result), at: this.now() };
+    try {
+      this.host.recordReceipt?.({
+        key: receiptKey, ...structuredClone(entry), subject, ...(born ? { born } : {}),
+        ...(state.batch ? { batch: structuredClone({ latest: state.batch.latest as CoalescedOccurrence<unknown>, notices: state.batch.notices, dropped: state.batch.dropped }) } : {}),
+      });
+    } catch (error) {
+      // Not acknowledged: the work would be lost while its receipt suppressed
+      // a retry. The producer retries within the window.
+      this.host.audit({ kind: 'persist-failed', subject, eventId: occurrence.eventId, error: String(error) });
+      throw new CoalesceError('eventId', 'host could not persist the acceptance; retry', -32000);
+    }
     this.receipts.set(receiptKey, entry);
-    this.host.recordReceipt?.({ key: receiptKey, ...structuredClone(entry), subject, ...(born ? { born } : {}) });
     this.prune();
     this.persist();
     return structuredClone(result);
@@ -403,12 +421,18 @@ export class PushCoalescer<E = unknown> {
   private async acceptDeferred(subject: string, state: SubjectState<E>, occurrence: CoalescedOccurrence<E>, occupantUnread: boolean): Promise<CoalesceOutcome> {
     let outcome: CoalesceOutcome = 'first';
     if (occupantUnread && state.occupant) {
-      // §5.1: a notice displaces an unread plain occurrence and opens a batch.
+      // §5.1: a notice displaces an unread plain occurrence and opens a batch
+      // — in the audience that held the plain occurrence (§3.2).
       this.host.audit({ kind: 'displaced', subject, eventId: state.occupant.eventId });
-      if (this.host.remove(state.occupant.placement)) outcome = 'replaced';
-      else { this.host.audit({ kind: 'remove-failed', subject, eventId: state.occupant.eventId }); state.history = 'unknown'; }
+      if (this.host.remove(state.occupant.placement)) {
+        outcome = 'replaced';
+        occurrence = { ...occurrence, deliverTo: state.occupant.placement.agent };
+      } else { this.host.audit({ kind: 'remove-failed', subject, eventId: state.occupant.eventId }); state.history = 'unknown'; }
       this.host.cancelWake(subject);
       state.occupant = undefined;
+    } else if (state.batch?.latest.deliverTo) {
+      // Later notices stay in the batch's audience.
+      occurrence = { ...occurrence, deliverTo: state.batch.latest.deliverTo };
     }
     const notice: DeferredNotice = { eventId: occurrence.eventId, timestamp: occurrence.timestamp, ...(occurrence.data !== undefined ? { data: structuredClone(occurrence.data) } : {}) };
     if (state.batch) {
@@ -453,6 +477,17 @@ export class PushCoalescer<E = unknown> {
       }
       const rendering: Rendering<E> = { batch, cancelled: false, done: Promise.resolve() };
       state.rendering = rendering;
+      // The render-start boundary is recoverable BEFORE the RPC: a restart
+      // then takes the fallback instead of asking the server a second time.
+      try {
+        if (this.host.saveNow) this.host.saveNow(this.snapshot()); else this.persist();
+      } catch (error) {
+        this.host.audit({ kind: 'persist-failed', subject, eventId: batch.latest.eventId, error: String(error) });
+        state.rendering = undefined;
+        batch.noRender = true; // cannot prove a render never started → fallback
+        state.batch = batch;
+      }
+      if (!state.rendering) { state.batch = batch; continue; }
       rendering.done = this.render(subject, state, rendering, agentName).finally(() => {
         if (state.rendering === rendering) state.rendering = undefined;
       });
@@ -548,6 +583,14 @@ export class PushCoalescer<E = unknown> {
       if (now - r.at > this.retryWindowMs) continue;
       this.receipts.set(r.key, { result: r.result, at: r.at });
       if (r.born && !this.subjects.has(r.subject)) this.subjects.set(r.subject, { history: r.born, touchedAt: now });
+      if (r.batch) {
+        // The accepted deferred work itself, newer than the snapshot. It never
+        // began rendering before the record was written, but the snapshot
+        // cannot say whether it did afterwards: take the fallback.
+        const state = this.subjects.get(r.subject) ?? { history: 'unknown' as const, touchedAt: now };
+        state.batch = { latest: r.batch.latest as CoalescedOccurrence<E>, notices: r.batch.notices, dropped: r.batch.dropped, noRender: true };
+        this.subjects.set(r.subject, state);
+      }
     }
   }
 
