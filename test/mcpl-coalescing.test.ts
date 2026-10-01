@@ -914,3 +914,49 @@ test('R15: a retraction arriving between the render result and its publication w
   assert.equal(ctx.split('document_diff').length - 1, 1, 'rendered exactly once');
   assert(ctx.includes('deleted_notice'), 'and corrected by the notice');
 });
+
+// ---------------------------------------------------------------------------
+// Review round 8 (#197): liveness after a failed render-start commit
+// ---------------------------------------------------------------------------
+
+test('R16: a batch whose render-start commit failed is re-woken once storage recovers', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const coalescer = (f.framework as unknown as { pushCoalescer: { options: { recoveryBackoffMs?: number }; pendingBatches(): number } }).pushCoalescer;
+  coalescer.options.recoveryBackoffMs = 50;
+  const internals = f.framework as unknown as { pendingRequests: unknown[] };
+  const store = (f.framework as unknown as { store: { sync: () => void } }).store;
+  const orig = store.sync.bind(store);
+  let failing = 0;
+  store.sync = () => { if (failing > 0) { failing--; throw new Error('EIO simulated'); } orig(); };
+  await f.send('push/event', f.params('1', 'asleep_fallback', { deferred: true, initial: true }));
+  failing = 1; // the render-start commit fails; storage then recovers
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 0);
+  assert.equal(coalescer.pendingBatches(), 1, 'the batch is kept');
+  assert(!f.lastRequest().includes('asleep_fallback'));
+  await eventually(() => internals.pendingRequests.length > 0, 'recovery wake');
+  await f.turn();
+  assert(f.lastRequest().includes('asleep_fallback'), 'delivered without unrelated traffic');
+  assert.equal(coalescer.pendingBatches(), 0);
+});
+
+test('R16b: a producer retry re-wakes a batch left asleep by a failed freeze', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const coalescer = (f.framework as unknown as { pushCoalescer: { options: { recoveryBackoffMs?: number }; pendingBatches(): number } }).pushCoalescer;
+  coalescer.options.recoveryBackoffMs = 600_000; // park the timer; the retry must do it
+  const internals = f.framework as unknown as { pendingRequests: unknown[] };
+  const store = (f.framework as unknown as { store: { sync: () => void } }).store;
+  const orig = store.sync.bind(store);
+  let failing = 0;
+  store.sync = () => { if (failing > 0) { failing--; throw new Error('EIO simulated'); } orig(); };
+  const params = f.params('1', 'asleep_fallback', { deferred: true, initial: true });
+  const first = await f.send('push/event', params);
+  failing = 1;
+  await f.framework.runUntilIdle();
+  assert.equal(internals.pendingRequests.length, 0, 'asleep');
+  const retry = await f.send('push/event', params);
+  assert.deepEqual(retry.result, first.result);
+  assert.equal(internals.pendingRequests.length, 1, 'the retry re-woke it');
+  await f.turn();
+  assert(f.lastRequest().includes('asleep_fallback'));
+});

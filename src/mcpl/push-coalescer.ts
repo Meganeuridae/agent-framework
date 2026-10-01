@@ -185,6 +185,9 @@ export interface CoalescerHost<E> {
 
 export interface CoalescerOptions {
   retryWindowMs?: number;
+  /** Base delay before re-waking a batch whose render-start commit failed
+   *  (doubles per attempt, capped at 60× base). Default 1 s. */
+  recoveryBackoffMs?: number;
   maxSubjects?: number;
   maxNotices?: number;
   maxContentBytes?: number;
@@ -266,6 +269,8 @@ export class PushCoalescer<E = unknown> {
    * and an assembly never acts on a batch an admission moved on from.
    */
   private serial: Promise<unknown> = Promise.resolve();
+  /** Liveness after a failed freeze: a bounded, backed-off re-wake per subject. */
+  private readonly recovery = new Map<string, { timer: ReturnType<typeof setTimeout>; attempt: number }>();
   private suspended = false;
 
   constructor(private readonly host: CoalescerHost<E>, private readonly options: CoalescerOptions = {}) {
@@ -349,7 +354,13 @@ export class PushCoalescer<E = unknown> {
     if (this.suspended) throw new CoalesceError('serverId', 'host is stopping', -32000);
     const subject = coalescingSubjectKey(occurrence.serverId, occurrence.binding, occurrence.scope, occurrence.key);
     const duplicate = this.receiptEntry(coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId));
-    if (duplicate) return this.acknowledge(coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId), duplicate, subject, occurrence.eventId);
+    if (duplicate) {
+      // A producer retrying acknowledged work is also a chance to notice a
+      // batch left asleep by a failed freeze: wake it now, without effects.
+      const state = this.subjects.get(subject);
+      if (state?.batch && !state.rendering) { this.clearRecovery(subject); await this.host.wakeForBatch(state.batch.latest); }
+      return this.acknowledge(coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId), duplicate, subject, occurrence.eventId);
+    }
     const born = this.subjects.has(subject) ? undefined : (occurrence.initial && !occurrence.retract ? 'none' as const : 'unknown' as const);
     const state = this.subjectFor(subject, occurrence);
     const occupantUnread = this.refreshOccupant(state);
@@ -412,7 +423,31 @@ export class PushCoalescer<E = unknown> {
     return false;
   }
 
+  private scheduleRecovery(subject: string, state: SubjectState<E>): void {
+    const prior = this.recovery.get(subject);
+    if (prior) clearTimeout(prior.timer);
+    const attempt = (prior?.attempt ?? 0) + 1;
+    const base = this.options.recoveryBackoffMs ?? 1_000;
+    const delay = Math.min(base * 2 ** (attempt - 1), base * 60);
+    const timer = setTimeout(() => {
+      this.recovery.delete(subject);
+      if (this.suspended || this.subjects.get(subject) !== state || !state.batch || state.rendering) return;
+      // Authority and wake policy are the host's, re-evaluated at fire time.
+      if (!this.host.authorized(state.batch.latest)) return;
+      this.host.audit({ kind: 'recovery-wake', subject, eventId: state.batch.latest.eventId, attempt });
+      void this.host.wakeForBatch(state.batch.latest).catch(() => { /* audited by the host */ });
+    }, delay);
+    (timer as { unref?: () => void }).unref?.();
+    this.recovery.set(subject, { timer, attempt });
+  }
+
+  private clearRecovery(subject: string): void {
+    const prior = this.recovery.get(subject);
+    if (prior) { clearTimeout(prior.timer); this.recovery.delete(subject); }
+  }
+
   private dropBatches(subject: string, state: SubjectState<E>): boolean {
+    this.clearRecovery(subject);
     let dropped = false;
     if (state.batch) { this.host.audit({ kind: 'displaced', subject, eventId: state.batch.latest.eventId, batch: true }); state.batch = undefined; dropped = true; }
     if (state.rendering) {
@@ -569,8 +604,13 @@ export class PushCoalescer<E = unknown> {
       state.rendering = undefined;
       batch.noRender = true; // cannot prove a render never started → fallback
       state.batch = batch;
+      // The wake was withdrawn above; acknowledged work must not sleep until
+      // unrelated traffic happens by. Re-wake with backoff, so a persistent
+      // storage outage does not become a tight loop of model turns.
+      this.scheduleRecovery(subject, state);
       return undefined;
     }
+    this.clearRecovery(subject);
     if (this.suspended) { state.rendering = undefined; state.batch = batch; return undefined; }
     // Authority (grant, registration, binding) is re-checked immediately
     // before dispatch: a server id reassigned to another endpoint during the
@@ -746,6 +786,7 @@ export class PushCoalescer<E = unknown> {
 
   suspend(): void {
     this.suspended = true;
+    for (const subject of [...this.recovery.keys()]) this.clearRecovery(subject);
     for (const [subject, state] of this.subjects) {
       if (state.rendering) { state.rendering.cancelled = true; this.host.audit({ kind: 'render-cancelled', subject, eventId: state.rendering.batch.latest.eventId, reason: 'suspend' }); }
     }
