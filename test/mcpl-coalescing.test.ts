@@ -6,115 +6,14 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { fork } from 'node:child_process';
+import { once } from 'node:events';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { once } from 'node:events';
-import { WebSocketServer, type WebSocket } from 'ws';
-import type { AddressInfo } from 'node:net';
-import type { FrameworkConfig } from '../src/types/framework.js';
-import { AgentFramework } from '../src/framework.js';
-import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
-
-const TS = '2026-09-30T00:00:00Z';
-const ok = () => createMockResponse([{ type: 'text', text: 'ok' }]);
-
-async function fixture(options: { server?: Record<string, unknown>; framework?: Partial<FrameworkConfig>; agents?: unknown[] } = {}) {
-  const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
-  await once(wss, 'listening');
-  let online = true;
-  let socket: WebSocket;
-  let next = 1000;
-  const replies = new Map<number, (value: unknown) => void>();
-  const renders: Array<Record<string, unknown>> = [];
-  const hostCaps: Array<Record<string, unknown>> = [];
-  const published: Array<Record<string, unknown>> = [];
-  let renderer: (params: Record<string, unknown>) => Promise<unknown> = async () => ({ content: [{ type: 'text', text: 'document_diff' }] });
-  wss.on('connection', (ws) => {
-    if (!online) { ws.close(); return; }
-    socket = ws;
-    ws.on('message', async (bytes) => {
-      const m = JSON.parse(String(bytes));
-      if (!m.method) { replies.get(m.id)?.(m); replies.delete(m.id); return; }
-      const reply = (result: unknown) => ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }));
-      if (m.method === 'initialize') {
-        hostCaps.push(m.params.capabilities.experimental.mcpl);
-        reply({ protocolVersion: '2024-11-05', capabilities: { tools: {}, experimental: { mcpl: {
-          version: '0.5', pushEvents: true, inferenceRequest: true,
-          channels: { incoming: true, register: true, lifecycle: true, publish: true },
-          featureSets: { doc: { description: 'doc', uses: ['pushEvents'] } },
-        } } }, serverInfo: { name: 'editor', version: '1' } });
-      } else if (m.method === 'featureSets/update') reply({ accepted: true });
-      else if (m.method === 'tools/list') reply({ tools: [] });
-      else if (m.method === 'channels/publish') { published.push(m.params); if (m.id !== undefined) reply({ delivered: true }); }
-      else if (m.method === 'channels/close') reply({ closed: true });
-      else if (m.method === 'channels/open') reply({ channel: { id: m.params.channelId, type: 'discord', label: m.params.channelId } });
-      else if (m.method === 'push/render') { renders.push(m.params); reply(await renderer(m.params)); }
-      else if (m.id !== undefined) reply({});
-    });
-  });
-  const dir = mkdtempSync(join(tmpdir(), 'coalescing-'));
-  let framework: AgentFramework;
-  const membrane = new MockMembrane();
-  membrane.pushResponse(ok());
-  const create = async (grantPush = true) => {
-    framework = await AgentFramework.create({
-      storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
-      agents: (options.agents ?? [{ name: 'agent', model: 'test', systemPrompt: 'test' }]) as FrameworkConfig['agents'],
-      modules: [], ...options.framework,
-      mcplServers: [{ id: 'editor', url: `ws://127.0.0.1:${(wss.address() as AddressInfo).port}`, enabledFeatureSets: ['doc'],
-        ...options.server, ...(grantPush ? {} : { disabledCapabilities: ['pushEvents'] }) }],
-    } as FrameworkConfig);
-    return framework;
-  };
-  const send = (method: string, params: unknown): Promise<any> => new Promise((resolve, reject) => {
-    const id = next++;
-    const timer = setTimeout(() => reject(new Error(`no reply to ${method}`)), 3000);
-    replies.set(id, (value) => { clearTimeout(timer); resolve(value); });
-    socket.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }));
-  });
-  await create();
-  return {
-    get framework() { return framework; }, membrane, renders, hostCaps, published, create, send, dir,
-    disconnect: () => socket.terminate(),
-    online: (value: boolean) => { online = value; },
-    register: (id = 'chat') => send('channels/register', { channels: [{ id, type: 'discord', label: id, metadata: { channelType: 'guild_text' } }] }),
-    /** A coalesced channels/incoming message for platform message `m`. */
-    channel: (eventId: string, text: string, flags: Record<string, unknown> = {}, channelId = 'chat', messageId = 'm') => ({
-      channelId, messageId, eventId, timestamp: TS, author: { id: 'u', name: 'User' }, tags: ['chat:mention'],
-      content: text ? [{ type: 'text', text }] : [], coalesce: { key: `message:${messageId}`, ...flags },
-    }),
-    /** A coalesced feature-set push. */
-    params: (eventId: string, text: string, flags: Record<string, unknown> = {}) => ({
-      featureSet: 'doc', eventId, timestamp: TS, coalesce: { key: 'document', ...flags },
-      payload: { content: text ? [{ type: 'text', text }] : [] },
-    }),
-    renderer: (fn: typeof renderer) => { renderer = fn; },
-    /** Serialized context of the primary agent. */
-    context: (agent = 'agent') => JSON.stringify(framework.getAgent(agent)!.getContextManager().getAllMessages()),
-    /** Serialized messages of the last model request (tool descriptions excluded). */
-    lastRequest: () => JSON.stringify((membrane.calls.at(-1) as { messages?: unknown } | undefined)?.messages),
-    turn: async () => { membrane.pushResponse(ok()); await framework.runUntilIdle(); },
-    /** Every subsequent model call gets a complete 'ok' response (multi-turn tests). */
-    alwaysRespond: () => {
-      (membrane as unknown as { streamYielding: unknown }).streamYielding = (request: unknown) => {
-        membrane.calls.push(request as never);
-        return new MockYieldingStream([ok()]);
-      };
-    },
-    close: async () => {
-      await framework.stop();
-      for (const client of wss.clients) client.terminate();
-      await new Promise<void>((r) => wss.close(() => r()));
-      rmSync(dir, { recursive: true, force: true });
-    },
-  };
-}
-
-async function eventually(predicate: () => boolean, what = 'condition'): Promise<void> {
-  const deadline = Date.now() + 3000;
-  while (!predicate()) { assert(Date.now() < deadline, `${what} did not settle`); await new Promise((r) => setTimeout(r, 10)); }
-}
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createMockResponse } from './helpers/mock-membrane.js';
+import { fixture, eventually, crash, ok, TS } from './helpers/coalescing-fixture.js';
 
 // ---------------------------------------------------------------------------
 // Plain coalescing, feature-set scope (vectors 1–6, 35)
@@ -509,7 +408,10 @@ test('#196 finding 2 / vector 34c: a busy channel never hits a subject cap', asy
   await f.framework.runUntilIdle();
   assert.equal(f.membrane.calls.length, 1);
   assert(f.lastRequest().includes('text_mention') && f.lastRequest().includes('text_0'));
-  assert(elapsed < 6000, `300 coalesced messages took ${elapsed}ms`);
+  // Each acceptance awaits a group-committed fsync (RFC-006 durability); serial
+  // sends cannot batch, so this is ~300 fsyncs. Bounded, and reported.
+  console.log(`# 300 serial coalesced channel messages: ${elapsed}ms (${(elapsed / 300).toFixed(1)} ms/msg incl. fsync)`);
+  assert(elapsed < 30_000, `300 coalesced messages took ${elapsed}ms`);
 });
 
 test('#196 finding 4: a context-budget restart does not assemble a pending batch', async (t) => {
@@ -741,15 +643,6 @@ test('G15: inference/request is refused while a cancelled render is still outsta
 // Review round 2 (#197): Codex R1–R4 on d86afc1
 // ---------------------------------------------------------------------------
 
-/** Simulate a crash: stop without the snapshot flush a clean stop performs. */
-async function crash(f: Awaited<ReturnType<typeof fixture>>): Promise<void> {
-  const internals = f.framework as unknown as { flushCoalescingSnapshot: () => void; coalescingSaveTimer: ReturnType<typeof setTimeout> | null };
-  if (internals.coalescingSaveTimer) clearTimeout(internals.coalescingSaveTimer);
-  internals.coalescingSaveTimer = null;
-  internals.flushCoalescingSnapshot = () => {};
-  await f.framework.stop();
-}
-
 test('R1: a deferred acceptance survives a crash before the snapshot flush, with its receipt', async (t) => {
   const f = await fixture(); t.after(f.close);
   const params = f.params('1', 'crash_fallback', { deferred: true, data: { k: 'v' } });
@@ -853,4 +746,35 @@ test('R7: a read plain occurrence recovered from a mid-window image still gets i
   const r2 = await f.send('push/event', f.params('4', 'notice2', { key: 'k2', retract: true }));
   assert.equal(r2.result.coalesce.outcome, 'noted', 'a stored occurrence counts as read after recovery (watermark at head)');
   assert(f.context().includes('never_read') && f.context().includes('notice2'));
+});
+
+// ---------------------------------------------------------------------------
+// Review round 5 (#197): durability under SIGKILL (no stop, no close, no sync)
+// ---------------------------------------------------------------------------
+
+async function killChild(mode: 'accept' | 'render'): Promise<{ dir: string; port: number; receipt: unknown }> {
+  const dir = mkdtempSync(join(tmpdir(), 'coalescing-kill-'));
+  const child = fork(join(dirname(fileURLToPath(import.meta.url)), 'helpers', 'coalescing-kill-child.js'), [dir, mode], { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
+  const [msg] = await once(child, 'message') as [{ port: number; receipt: unknown }];
+  child.kill('SIGKILL');
+  await once(child, 'exit');
+  return { dir, port: msg.port, receipt: msg.receipt };
+}
+
+test('R8 (kill, acceptance): the receipt and the accepted work survive SIGKILL after the wire ack', async (t) => {
+  const { dir, port, receipt } = await killChild('accept');
+  const f = await fixture({ dir, port }); t.after(async () => { await f.close(); rmSync(dir, { recursive: true, force: true }); });
+  const retry = await f.send('push/event', f.params('1', 'killed_fallback', { deferred: true, data: { k: 'v' } }));
+  assert.deepEqual(retry.result, receipt, 'the receipt survived the kill');
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 1, 'the accepted work survived the kill');
+  assert(f.lastRequest().includes('killed_fallback'));
+});
+
+test('R9 (kill, render-start): a render that may have run is not issued again after SIGKILL', async (t) => {
+  const { dir, port } = await killChild('render');
+  const f = await fixture({ dir, port }); t.after(async () => { await f.close(); rmSync(dir, { recursive: true, force: true }); });
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 0, 'no second push/render');
+  assert(f.lastRequest().includes('render_fallback'), 'the fallback is delivered instead');
 });

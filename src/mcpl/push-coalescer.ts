@@ -168,6 +168,11 @@ export interface CoalescerHost<E> {
   /** Persist one receipt now, before the acceptance is acknowledged. Throws
    *  on failure, which fails the acceptance (the producer retries). */
   recordReceipt?(record: CoalescingReceiptRecord): void;
+  /** Make every write so far DURABLE (fsync, group-committed by the host).
+   *  Awaited before an acceptance is acknowledged and before push/render is
+   *  issued: a kill after either boundary must find the receipt, the
+   *  accepted work, and the render-start on disk. Rejects on failure. */
+  commit?(): Promise<void>;
   /** Recovery: is this occurrence's content in a context (its durable
    *  delivery identity — subject + eventId in message metadata — is found
    *  there)? A published occurrence is read from recovery on (the watermark
@@ -336,6 +341,15 @@ export class PushCoalescer<E = unknown> {
     this.receipts.set(receiptKey, entry);
     this.prune();
     this.persist();
+    try {
+      await this.host.commit?.();
+    } catch (error) {
+      // Written but not durable: do not acknowledge. The in-memory receipt
+      // stays, so a retry while this process lives is deduplicated; after a
+      // kill nothing of it exists and the retry is a fresh acceptance.
+      this.host.audit({ kind: 'persist-failed', subject, eventId: occurrence.eventId, error: String(error) });
+      throw new CoalesceError('eventId', 'host could not make the acceptance durable; retry', -32000);
+    }
     return structuredClone(result);
   }
 
@@ -488,6 +502,7 @@ export class PushCoalescer<E = unknown> {
       // then takes the fallback instead of asking the server a second time.
       try {
         if (this.host.saveNow) this.host.saveNow(this.snapshot()); else this.persist();
+        await this.host.commit?.();
       } catch (error) {
         this.host.audit({ kind: 'persist-failed', subject, eventId: batch.latest.eventId, error: String(error) });
         state.rendering = undefined;

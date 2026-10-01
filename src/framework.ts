@@ -1256,6 +1256,8 @@ export class AgentFramework {
   private coalescingSaveTimer: ReturnType<typeof setTimeout> | null = null;
   private coalescingSnapshotDirty: (() => CoalescingSnapshot) | null = null;
   private coalescingRecentReceipts: CoalescingReceiptRecord[] = [];
+  /** Group commit: one fsync per event-loop turn, shared by every waiter. */
+  private coalescingCommit: Promise<void> | null = null;
   private inferenceRouter: InferenceRouter | null = null;
   private channelRegistry: ChannelRegistry | null = null;
   private checkpointManager: CheckpointManager | null = null;
@@ -7365,6 +7367,7 @@ export class AgentFramework {
         }
         return false;
       },
+      commit: () => this.commitCoalescingDurable(),
       saveNow: (snapshot) => {
         if (this.coalescingSaveTimer) { clearTimeout(this.coalescingSaveTimer); this.coalescingSaveTimer = null; }
         this.coalescingSnapshotDirty = null;
@@ -7383,6 +7386,25 @@ export class AgentFramework {
     this.pushCoalescer = coalescer;
     // Batches restored from a snapshot still owe the agent a wake (§14 v41).
     for (const occ of coalescer.pendingBatchOccurrences()) void this.wakeForCoalescedBatch(occ);
+  }
+
+  /**
+   * Durability barrier for coalescing (RFC-006 §3.1/§3.2): everything
+   * written so far is fsynced before the caller proceeds. Group-committed —
+   * all acceptances that arrive in one event-loop turn share one
+   * `store.sync()` — so throughput is bounded by fsync rate per batch, not
+   * per message.
+   */
+  private commitCoalescingDurable(): Promise<void> {
+    if (!this.coalescingCommit) {
+      this.coalescingCommit = new Promise<void>((resolve, reject) => {
+        setImmediate(() => {
+          this.coalescingCommit = null;
+          try { this.store.sync(); resolve(); } catch (err) { reject(err); }
+        });
+      });
+    }
+    return this.coalescingCommit;
   }
 
   private scheduleCoalescingSnapshot(snapshot: () => CoalescingSnapshot): void {
