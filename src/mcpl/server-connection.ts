@@ -145,6 +145,10 @@ export class McplServerConnection extends EventEmitter {
    */
   toolObserveFilter: ToolObserveRule[] | null = null;
 
+  /** Increments at every transport boundary. RFC-007 terminals go only to
+   *  the epoch their opening went to, never across a reconnect. */
+  transportEpoch = 0;
+
   /**
    * §17 manifest tracking (host side of RFC-003): what this host actually
    * fetched and acted on — never the server's announcement log (§17.10:
@@ -178,6 +182,7 @@ export class McplServerConnection extends EventEmitter {
   private resetPolicyForTransportBoundary(): void {
     this.grant = CapabilityGrant.empty();
     this.policyEstablished = false;
+    this.transportEpoch++;
     // RFC-007 §6.5: a filter is per connection epoch — after a reconnect the
     // server sends it again, and until then receives metadata only.
     this.toolObserveFilter = null;

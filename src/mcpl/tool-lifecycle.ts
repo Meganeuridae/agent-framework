@@ -137,6 +137,14 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 export function parseToolObserveParams(params: unknown): ToolObserveParseResult {
   if (params === undefined || params === null) return { ok: true, rules: null };
   if (!isPlainObject(params)) return { ok: false, message: 'tools/observe params must be an object' };
+  // Unknown members are rejected here too (MCP's own `_meta` excepted): a
+  // misspelled `rules` must not read as "no rules" and silently clear a
+  // restrictive filter.
+  for (const key of Object.keys(params)) {
+    if (key !== 'rules' && key !== '_meta') {
+      return { ok: false, message: `tools/observe: unknown params member "${key}"` };
+    }
+  }
   const raw = params.rules;
   if (raw === undefined || raw === null) return { ok: true, rules: null };
   if (!Array.isArray(raw)) return { ok: false, message: 'tools/observe: rules must be an array or null' };
@@ -226,24 +234,36 @@ function anyGlob(patterns: readonly string[], subject: string): boolean {
   return false;
 }
 
-function narrowingClasses(n: ToolLifecycleNarrowing): readonly ToolClass[] | undefined {
-  if (n.classes === 'default') return DEFAULT_INPUT_CLASSES;
-  return n.classes;
-}
+const isStringArray = (v: unknown): v is string[] => Array.isArray(v) && v.every((x) => typeof x === 'string');
 
-/** Every stated key must hold. An unclassed tool never satisfies `classes`. */
+/**
+ * Every stated key must hold. An unclassed tool never satisfies `classes`.
+ * Policy comes from operator config (JSON recipes), so a key of the wrong
+ * shape admits NOTHING rather than being read as absent — fail closed.
+ */
 function narrowingAdmits(n: ToolLifecycleNarrowing, call: ToolCallDescriptor): boolean {
-  if (n.tools && !anyGlob(n.tools, call.tool)) return false;
-  const classes = narrowingClasses(n);
-  if (classes && !call.class.some((c) => classes.includes(c))) return false;
-  if (n.conversations && !anyGlob(n.conversations, call.conversationId)) return false;
+  if (n.tools !== undefined && (!isStringArray(n.tools) || !anyGlob(n.tools, call.tool))) return false;
+  if (n.classes !== undefined) {
+    const classes = n.classes === 'default' ? DEFAULT_INPUT_CLASSES : n.classes;
+    if (!Array.isArray(classes) || !call.class.some((c) => classes.includes(c))) return false;
+  }
+  if (n.conversations !== undefined
+    && (!isStringArray(n.conversations) || !anyGlob(n.conversations, call.conversationId))) {
+    return false;
+  }
   return true;
 }
 
-/** `observe` narrowing: absent means no narrowing (the grant is enough). */
+/**
+ * `observe` narrowing: absent means no narrowing (the grant is enough). A
+ * value that is not a narrowing object (`false`, `null`, a string) admits
+ * nothing: a setting that looks like "off" must never read as "everything".
+ */
 export function observeAdmits(config: ToolLifecycleConfig | undefined, call: ToolCallDescriptor): boolean {
-  const n = config?.observe;
-  return !n || narrowingAdmits(n, call);
+  const n = config?.observe as unknown;
+  if (n === undefined) return true;
+  if (!isPlainObject(n)) return false;
+  return narrowingAdmits(n as ToolLifecycleNarrowing, call);
 }
 
 /**
@@ -252,7 +272,7 @@ export function observeAdmits(config: ToolLifecycleConfig | undefined, call: Too
  * (RFC-007 §4.3 — the widest form is not producible by omission).
  */
 export function inputsNarrowingIsUnconditional(n: ToolLifecycleNarrowing | undefined): boolean {
-  if (!n) return true;
+  if (!isPlainObject(n)) return true;
   const hasTools = Array.isArray(n.tools) && n.tools.length > 0;
   const hasClasses = n.classes === 'default' || (Array.isArray(n.classes) && n.classes.length > 0);
   return !hasTools && !hasClasses;
@@ -416,6 +436,9 @@ export interface ToolLifecycleObserver {
   id: string;
   grant?: CapabilityGrant;
   toolObserveFilter?: ToolObserveRule[] | null;
+  /** Increments at every transport boundary (reconnect). Terminals go only
+   *  to the epoch the opening went to. Absent = 0. */
+  transportEpoch?: number;
   sendToolLifecycle(params: ToolLifecycleParams): void;
 }
 
@@ -495,33 +518,40 @@ export interface ToolLifecycleHost {
   observers(): Iterable<ToolLifecycleObserver>;
   /** Host policy for one connection. */
   configFor(serverId: string): ToolLifecycleConfig | undefined;
-  /** Class and provider for a model-facing tool name. */
-  describe(tool: string): { class: ToolClass[]; serverId?: string; serverTool?: string };
+  /**
+   * Class and provider for a model-facing tool name, and whether the host
+   * will refuse the call before executing it (e.g. its provider is gone, or
+   * host tool policy denies it). A refused call produces no events.
+   */
+  describe(tool: string): { class: ToolClass[]; serverId?: string; serverTool?: string; refused?: boolean };
 }
 
 interface TrackedCall {
   agentName: string;
   modelCallId: string;
   call: ToolCallDescriptor;
-  /** Connection ids the opening went to. */
-  openedTo: Set<string>;
-  opened: boolean;
+  /** Connection id → transport epoch the opening went to. */
+  openedTo: Map<string, number>;
   startedAt: number;
-  /** A dispatch-failure trace was seen for this call. */
+  /** The host could not obtain a result (a dispatch catch path). */
   failed: boolean;
-  /** The failure came before any start: the host refused to execute. */
-  refused: boolean;
 }
 
-/** Ids at least this long are provider-random; shorter ones (`call_0`) are
- *  numbered per response and collide across inferences (RFC-007 §3). */
-const MIN_TRUSTED_ID_LENGTH = 16;
+/**
+ * Provider identifiers trusted as unique (RFC-007 §3 rev 3: reuse the
+ * model's id only where the provider guarantees it). Anthropic `tool_use`
+ * ids are random and at least this long; everything else — per-response
+ * counters like `call_0`, other providers' formats — is minted over.
+ */
+const PROVIDER_UNIQUE_ID = /^toolu_[A-Za-z0-9]{20,}$/;
 const RECENT_ID_WINDOW = 8192;
+
+const callKey = (agentName: string, callId: string): string => `${agentName}\u0000${callId}`;
 
 export class ToolLifecycleEmitter {
   private readonly host: ToolLifecycleHost;
   private readonly now: () => number;
-  /** Tracked calls, keyed `${agentName}\0${modelCallId}`. */
+  /** Opened calls awaiting their terminal, keyed by (agent, model call id). */
   private readonly calls = new Map<string, TrackedCall>();
   private readonly recentIds = new Set<string>();
   private readonly recentOrder: string[] = [];
@@ -541,13 +571,13 @@ export class ToolLifecycleEmitter {
   }
 
   /**
-   * A host-unique id for a call: the model's own where it is long enough to
-   * be provider-random and not seen recently, minted otherwise. Uniqueness
-   * is per process, which covers every connection's lifetime.
+   * A host-unique id for a call (RFC-007 §3): the model's own only where the
+   * provider guarantees it unique and it was not reported recently; minted
+   * otherwise. Minted ids carry a per-process counter, so they never repeat.
    */
   private hostCallId(modelCallId: string): string {
     let id = modelCallId;
-    if (id.length < MIN_TRUSTED_ID_LENGTH || this.recentIds.has(id)) {
+    if (!PROVIDER_UNIQUE_ID.test(id) || this.recentIds.has(id)) {
       id = `${modelCallId}~h${(++this.mintSeq).toString(36)}`;
     }
     this.recentIds.add(id);
@@ -559,52 +589,38 @@ export class ToolLifecycleEmitter {
   }
 
   /**
-   * Register a model-issued call about to be dispatched. Nothing is sent
-   * yet: `started` goes out when execution begins (onTrace), so a call the
-   * host refuses before executing produces no events.
+   * A model-issued call is being dispatched for execution: send `started`
+   * to every connection that should see it. Called at the single dispatch
+   * point, keyed by (agent, model call id) — no trace-stream lookups, so two
+   * agents' identical short ids cannot cross. A call the host refuses before
+   * executing (describe().refused) produces no events at all.
    */
   register(agentName: string, inferenceId: string, call: { id: string; name: string; input: unknown }): void {
     if (!this.anyObserver()) return;
     const described = this.host.describe(call.name);
-    const descriptor: ToolCallDescriptor = {
-      toolCallId: this.hostCallId(call.id),
-      inferenceId,
-      conversationId: agentName,
-      tool: call.name,
-      class: described.class,
-      ...(described.serverId !== undefined
-        ? { serverId: described.serverId, serverTool: described.serverTool }
-        : {}),
-      input: call.input,
-    };
-    this.calls.set(`${agentName}\u0000${call.id}`, {
+    if (described.refused) return;
+    const tracked: TrackedCall = {
       agentName,
       modelCallId: call.id,
-      call: descriptor,
-      openedTo: new Set(),
-      opened: false,
+      call: {
+        toolCallId: this.hostCallId(call.id),
+        inferenceId,
+        conversationId: agentName,
+        tool: call.name,
+        class: described.class,
+        ...(described.serverId !== undefined
+          ? { serverId: described.serverId, serverTool: described.serverTool }
+          : {}),
+        input: call.input,
+      },
+      openedTo: new Map(),
       startedAt: this.now(),
       failed: false,
-      refused: false,
-    });
-  }
-
-  /** Trace events carry the model call id but not the agent: find the
-   *  oldest tracked call with that id that is in the state we expect. */
-  private byModelId(callId: string, want: (t: TrackedCall) => boolean): TrackedCall | undefined {
-    for (const tracked of this.calls.values()) {
-      if (tracked.modelCallId === callId && want(tracked)) return tracked;
-    }
-    return undefined;
-  }
-
-  private open(tracked: TrackedCall, phase: 'pending' | 'started'): void {
-    tracked.opened = true;
-    tracked.startedAt = this.now();
+    };
     for (const observer of this.host.observers()) {
       let params: ToolLifecycleParams | null;
       try {
-        params = openingFor(observer, this.host.configFor(observer.id), tracked.call, phase);
+        params = openingFor(observer, this.host.configFor(observer.id), tracked.call, 'started');
       } catch (err) {
         console.error(`[mcpl] ${observer.id}: tools/lifecycle decision failed: ${(err as Error).message}`);
         continue;
@@ -612,19 +628,33 @@ export class ToolLifecycleEmitter {
       if (!params) continue;
       try {
         observer.sendToolLifecycle(params);
-        tracked.openedTo.add(observer.id);
+        tracked.openedTo.set(observer.id, observer.transportEpoch ?? 0);
       } catch {
         /* best-effort */
       }
     }
+    if (tracked.openedTo.size > 0) this.calls.set(callKey(agentName, call.id), tracked);
+  }
+
+  /**
+   * The host could not obtain a result for this call (its dispatch threw,
+   * the provider's transport failed, the request timed out). Its terminal
+   * will be `failed`. An error RESULT returned by the tool is not this: it
+   * is `completed` with `isError` (RFC-007 §3).
+   */
+  markDispatchFailure(agentName: string, callId: string): void {
+    const tracked = this.calls.get(callKey(agentName, callId));
+    if (tracked) tracked.failed = true;
   }
 
   private terminate(tracked: TrackedCall, phase: 'completed' | 'failed' | 'aborted', isError?: boolean): void {
-    this.calls.delete(`${tracked.agentName}\u0000${tracked.modelCallId}`);
-    if (tracked.openedTo.size === 0) return;
+    this.calls.delete(callKey(tracked.agentName, tracked.modelCallId));
     const durationMs = Math.max(0, this.now() - tracked.startedAt);
     for (const observer of this.host.observers()) {
-      if (!tracked.openedTo.has(observer.id)) continue;
+      const epoch = tracked.openedTo.get(observer.id);
+      // Only the transport epoch the opening went to: a reconnected observer
+      // never receives a terminal for an opening it did not see (§7.3).
+      if (epoch === undefined || epoch !== (observer.transportEpoch ?? 0)) continue;
       if (!terminalStillAllowed(observer, this.host.configFor(observer.id), tracked.call)) continue;
       const params = baseParams(tracked.call, phase);
       if (phase === 'completed') params.isError = !!isError;
@@ -637,51 +667,28 @@ export class ToolLifecycleEmitter {
     }
   }
 
-  /** Framework trace events: `tool:started` opens, `tool:failed` marks. */
-  onTrace(event: { type: string; callId?: unknown }): void {
-    if (this.calls.size === 0) return;
-    if (typeof event.callId !== 'string') return;
-    if (event.type === 'tool:started') {
-      const tracked = this.byModelId(event.callId, (t) => !t.opened && !t.refused);
-      if (tracked) this.open(tracked, 'started');
-    } else if (event.type === 'tool:failed') {
-      const tracked = this.byModelId(event.callId, (t) => !t.failed);
-      if (tracked) {
-        tracked.failed = true;
-        if (!tracked.opened) tracked.refused = true;
-      }
-    }
-  }
-
   /** A tool result reached the host: the call's terminal. */
   onResult(agentName: string, callId: string, result: { success?: boolean; isError?: boolean } | undefined): void {
     if (this.calls.size === 0) return;
-    const tracked = this.calls.get(`${agentName}\u0000${callId}`);
+    const tracked = this.calls.get(callKey(agentName, callId));
     if (!tracked) return;
-    if (tracked.refused) {
-      // Refused before execution: no events at all (RFC-007 §3).
-      this.calls.delete(`${agentName}\u0000${callId}`);
-      return;
-    }
-    // Paths that answer without a start trace still get a paired opening.
-    if (!tracked.opened) this.open(tracked, 'started');
-    if (tracked.failed) {
-      this.terminate(tracked, 'failed');
-    } else {
-      this.terminate(tracked, 'completed', result?.isError === true || result?.success === false);
-    }
+    if (tracked.failed) this.terminate(tracked, 'failed');
+    else this.terminate(tracked, 'completed', result?.isError === true || result?.success === false);
   }
 
   /**
-   * The agent's stream ended: every call of that agent still open was
-   * cancelled before a result. A result arriving later finds nothing.
+   * A stream ended: its calls still open were cancelled before a result.
+   * Scoped to the inference ids that stream minted, so a successor stream
+   * for the same agent (a budget restart overlapping this one's teardown)
+   * keeps its live calls. A result arriving later finds nothing.
    */
-  abortOpen(agentName: string): void {
+  abortOpen(agentName: string, inferenceIds: Iterable<string>): void {
     if (this.calls.size === 0) return;
+    const ids = new Set(inferenceIds);
     for (const tracked of [...this.calls.values()]) {
-      if (tracked.agentName !== agentName) continue;
-      if (tracked.opened && !tracked.refused) this.terminate(tracked, 'aborted');
-      else this.calls.delete(`${tracked.agentName}\u0000${tracked.modelCallId}`);
+      if (tracked.agentName === agentName && ids.has(tracked.call.inferenceId)) {
+        this.terminate(tracked, 'aborted');
+      }
     }
   }
 

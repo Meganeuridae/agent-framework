@@ -17,7 +17,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { AgentFramework } from '../src/index.js';
@@ -68,6 +68,7 @@ describe('tool lifecycle end to end (RFC-007)', () => {
   let tempDir: string;
   let obsLog: string;
   let provLog: string;
+  let diePath: string;
   let membrane: MockMembrane;
   let framework: AgentFramework;
 
@@ -75,6 +76,7 @@ describe('tool lifecycle end to end (RFC-007)', () => {
     tempDir = mkdtempSync(join(tmpdir(), 'tool-lifecycle-e2e-'));
     obsLog = join(tempDir, 'observer.jsonl');
     provLog = join(tempDir, 'provider.jsonl');
+    diePath = join(tempDir, 'provider.die');
     membrane = new MockMembrane();
     framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
@@ -87,7 +89,7 @@ describe('tool lifecycle end to end (RFC-007)', () => {
           toolPrefix: 'prov',
           command: process.execPath,
           args: [FIXTURE],
-          env: { ROLE: 'provider', LOG_PATH: provLog },
+          env: { ROLE: 'provider', LOG_PATH: provLog, DIE_PATH: diePath },
         },
         {
           id: 'obs',
@@ -193,5 +195,39 @@ describe('tool lifecycle end to end (RFC-007)', () => {
 
     // The provider, which holds no toolLifecycle grant, received nothing.
     assert.equal(readLog(provLog).filter((e) => e.event === 'lifecycle').length, 0);
+  });
+  it('a provider that dies takes its classes with it, and calls to it are never reported (review #3, #4)', async () => {
+    const internals = framework as unknown as {
+      mcplServerRegistry: { getServer(id: string): unknown } | null;
+      describeToolForLifecycle(tool: string): { class: string[]; refused?: boolean };
+    };
+    assert.deepEqual(internals.describeToolForLifecycle('prov--click').class, ['computer'], 'classed while alive');
+
+    writeFileSync(diePath, '');
+    await waitFor(() => internals.mcplServerRegistry?.getServer('prov') == null, 'provider removed from the registry');
+
+    // #3: the stale declaration is gone — unclassed (restrictive) until re-listed.
+    const described = internals.describeToolForLifecycle('prov--click');
+    assert.deepEqual(described.class, []);
+    // #4: the host will refuse the call before executing it.
+    assert.equal(described.refused, true);
+
+    const before = readLog(obsLog).filter((e) => e.event === 'lifecycle').length;
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'toolu_01DDDDDDDDDDDDDDDDDDDDDD', name: 'prov--click', input: { x: 1, y: 2 } },
+    ] as never, 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'It is gone.' }]));
+    framework.pushEvent({
+      type: 'external-message',
+      source: 'test',
+      content: [{ type: 'text', text: 'again' }],
+      metadata: {},
+      triggerInference: true,
+    } as unknown as ProcessEvent);
+    await waitFor(() => (membrane.lastStream?.receivedToolResults.length ?? 0) >= 1
+      && membrane.lastStream !== null && membrane.calls.length >= 2, 'the refused call answered');
+    await new Promise((r) => setTimeout(r, 300));
+    const after = readLog(obsLog).filter((e) => e.event === 'lifecycle').length;
+    assert.equal(after, before, 'a call the host refused (provider gone) produces no events');
   });
 });

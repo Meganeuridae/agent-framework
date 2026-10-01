@@ -235,9 +235,20 @@ const DENY_BY_DEFAULT: readonly string[] = [
  * who wrote a narrowing meant to grant what it narrows.
  */
 function configGrants(config: Pick<McplServerConfig, 'toolLifecycle'>, path: string): boolean {
-  if (path === 'toolLifecycle.observe') return config.toolLifecycle?.observe !== undefined;
-  if (path === 'toolLifecycle.inputs') return config.toolLifecycle?.inputs !== undefined;
-  return false;
+  const key = path === 'toolLifecycle.observe' ? 'observe' : path === 'toolLifecycle.inputs' ? 'inputs' : null;
+  if (!key) return false;
+  const block = (config.toolLifecycle as Record<string, unknown> | undefined)?.[key];
+  if (block === undefined) return false;
+  // Only a policy OBJECT is a grant. `observe: false` (or null, or a string)
+  // must never read as "granted with no narrowing".
+  if (!isPlainObject(block)) {
+    console.error(
+      `[mcpl] toolLifecycle.${key} is ${JSON.stringify(block)}, not a policy object — ` +
+        `not granted by this block (RFC-007 §4.1)`,
+    );
+    return false;
+  }
+  return true;
 }
 
 export class CapabilityGrant {
@@ -342,7 +353,7 @@ export function computeGrant(
       console.error('[mcpl] toolLifecycle.inputs granted without toolLifecycle.observe — delivers nothing (RFC-007 §4.1)');
     }
     const n = config.toolLifecycle?.inputs;
-    const hasTerm = !!n && ((Array.isArray(n.tools) && n.tools.length > 0)
+    const hasTerm = isPlainObject(n) && ((Array.isArray(n.tools) && n.tools.length > 0)
       || n.classes === 'default' || (Array.isArray(n.classes) && n.classes.length > 0));
     if (!hasTerm) {
       console.error(

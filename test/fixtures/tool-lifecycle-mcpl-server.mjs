@@ -8,10 +8,15 @@
 //   tool `ping` (its own calls must not be reported to it), and once the §5.3
 //   policy exchange is done sends `tools/observe` with the rules in FILTER
 //   (JSON). Received `tools/lifecycle` notifications go to LOG_PATH as JSONL.
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, existsSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
 const role = process.env.ROLE ?? 'provider';
+// DIE_PATH: exit as soon as this file exists — an unexpected provider death
+// (the host has reconnect off, so the registry drops the server).
+if (process.env.DIE_PATH) {
+  setInterval(() => { if (existsSync(process.env.DIE_PATH)) process.exit(0); }, 50).unref?.();
+}
 const logPath = process.env.LOG_PATH;
 const filter = process.env.FILTER ? JSON.parse(process.env.FILTER) : null;
 
