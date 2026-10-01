@@ -823,15 +823,20 @@ test('R11: a retraction during the render-start commit wait is final; the batch 
   const held = holdNextCommit(f);
   const run = f.framework.runUntilIdle();
   const release = await held;
-  const r = await f.send('push/event', f.params('2', 'notice', { retract: true }));
-  assert.equal(r.result.coalesce.outcome, 'retracted');
+  // The freeze (including this commit wait) is one critical section with
+  // admission: the retraction is admitted only after it, so it is sent
+  // without awaiting here and settles either way as a cancellation.
+  const pending = f.send('push/event', f.params('2', 'notice', { retract: true }));
   release();
+  const r = await pending;
+  assert.equal(r.result.coalesce.outcome, 'retracted');
   await run;
-  assert.equal(f.renders.length, 0);
   assert.equal((f.framework as unknown as { pushCoalescer: { pendingBatches(): number } }).pushCoalescer.pendingBatches(), 0);
+  assert(!f.context().includes('withdrawn_fallback') && !f.lastRequest().includes('document_diff'), 'nothing of the withdrawn batch was published');
+  const renders = f.renders.length;
   await f.turn();
-  assert.equal(f.renders.length, 0);
-  assert(!f.context().includes('withdrawn_fallback'));
+  assert.equal(f.renders.length, renders, 'and nothing renders later');
+  assert(!f.context().includes('withdrawn_fallback') && !f.context().includes('document_diff'));
 });
 
 test('R12: endpoint reassignment during the render-start commit wait never sends the batch to the new peer', async (t) => {
@@ -865,12 +870,14 @@ test('R13: a retraction during the audience lookup is final; the stale batch is 
   });
   const run = f.framework.runUntilIdle();
   await held;
-  const r = await f.send('push/event', f.params('2', 'notice', { retract: true }));
-  assert.equal(r.result.coalesce.outcome, 'retracted');
+  const pending = f.send('push/event', f.params('2', 'notice', { retract: true }));
   release();
+  const r = await pending;
+  assert.equal(r.result.coalesce.outcome, 'retracted');
   await run;
-  assert.equal(f.renders.length, 0, 'the withdrawn batch was not rendered');
-  assert(!f.context().includes('withdrawn_fallback') && !f.lastRequest().includes('document_diff'));
+  assert(!f.context().includes('withdrawn_fallback') && !f.context().includes('document_diff'), 'nothing of the withdrawn batch was published');
+  await f.turn();
+  assert(!f.context().includes('document_diff'));
 });
 
 test('R14: two consecutive crash windows with an acceptance in between keep both recovered batches', async (t) => {
@@ -884,4 +891,26 @@ test('R14: two consecutive crash windows with an acceptance in between keep both
   await f.framework.runUntilIdle();
   const req = f.lastRequest();
   assert(req.includes('first_window_fallback') && req.includes('second_window_fallback'), 'both recovered batches delivered');
+});
+
+test('R15: a retraction arriving between the render result and its publication waits for the settlement', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', f.params('1', 'fallback', { deferred: true, initial: true }));
+  const internals = f.framework as unknown as { deliverCoalesced: (...a: unknown[]) => Promise<unknown> };
+  const orig = internals.deliverCoalesced.bind(internals);
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    internals.deliverCoalesced = (...a) => { internals.deliverCoalesced = orig; return new Promise((res) => { release = () => orig(...a).then(res); resolve(); }); };
+  });
+  f.alwaysRespond(); // the notice wakes a second turn
+  const run = f.framework.runUntilIdle();
+  await held; // the render result is in hand; publication is being settled
+  const pending = f.send('push/event', f.params('2', 'deleted_notice', { retract: true }));
+  release();
+  const r = await pending;
+  assert.equal(r.result.coalesce.outcome, 'noted', 'the retraction saw the published render as read');
+  await run;
+  const ctx = f.context();
+  assert.equal(ctx.split('document_diff').length - 1, 1, 'rendered exactly once');
+  assert(ctx.includes('deleted_notice'), 'and corrected by the notice');
 });

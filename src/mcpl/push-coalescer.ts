@@ -27,6 +27,8 @@ export const PUSH_COALESCING_SUPPORT = {
 export const COALESCE_OUTCOMES = ['first', 'replaced', 'appended', 'retracted', 'noted', 'consumed'] as const;
 export type CoalesceOutcome = typeof COALESCE_OUTCOMES[number];
 
+class CancelledRender extends Error {}
+
 export class CoalesceError extends Error {
   constructor(readonly field: string, message: string, readonly code = -32602) {
     super(message);
@@ -255,6 +257,15 @@ export class PushCoalescer<E = unknown> {
   private readonly maxNotices: number;
   /** Outstanding push/render RPCs per server, including cancelled ones (§10.7). */
   private readonly rendersInFlight = new Map<string, number>();
+  /**
+   * The ONE critical section. Every state transition — an admission, the
+   * freezing of a batch for rendering, the settlement of a render's result —
+   * runs under it, awaits included (fork spawn, durability commit, delivery).
+   * Only the push/render RPC itself runs outside, so it stays cancellable.
+   * An admission therefore never observes a half-done assembly transition,
+   * and an assembly never acts on a batch an admission moved on from.
+   */
+  private serial: Promise<unknown> = Promise.resolve();
   private suspended = false;
 
   constructor(private readonly host: CoalescerHost<E>, private readonly options: CoalescerOptions = {}) {
@@ -264,6 +275,12 @@ export class PushCoalescer<E = unknown> {
   }
 
   private now(): number { return this.host.now?.() ?? Date.now(); }
+
+  private locked<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.serial.then(fn, fn);
+    this.serial = run.then(() => undefined, () => undefined);
+    return run;
+  }
 
   // ---------------------------------------------------------------------------
   // Observation
@@ -324,7 +341,11 @@ export class PushCoalescer<E = unknown> {
    * host effects (replace / remove / deliver) synchronously so a create, edit
    * and delete cannot overtake one another.
    */
-  async accept(occurrence: CoalescedOccurrence<E>): Promise<PushEventResult> {
+  accept(occurrence: CoalescedOccurrence<E>): Promise<PushEventResult> {
+    return this.locked(() => this.admit(occurrence));
+  }
+
+  private async admit(occurrence: CoalescedOccurrence<E>): Promise<PushEventResult> {
     if (this.suspended) throw new CoalesceError('serverId', 'host is stopping', -32000);
     const subject = coalescingSubjectKey(occurrence.serverId, occurrence.binding, occurrence.scope, occurrence.key);
     const duplicate = this.receiptEntry(coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId));
@@ -499,63 +520,68 @@ export class PushCoalescer<E = unknown> {
   async assemble(agentName: string): Promise<void> {
     if (this.suspended) return;
     const work: Promise<void>[] = [];
-    for (const [subject, state] of this.subjects) {
-      if (state.rendering) {
-        // Another assembly froze this batch; share its outcome (vector 25).
-        const rendering = state.rendering;
-        if ((await this.host.audience(rendering.batch.latest)).includes(agentName) && state.rendering === rendering) work.push(rendering.done);
-        continue;
-      }
-      const batch = state.batch;
-      if (!batch) continue;
-      const audience = await this.host.audience(batch.latest);
-      // The audience lookup may spawn a fork and awaits: a retraction, a
-      // replacement or another assembly can move the subject on meanwhile.
-      // Only the batch that is STILL the subject's pending batch is frozen.
-      if (!audience.includes(agentName) || state.batch !== batch || state.rendering) continue;
-      state.batch = undefined;
-      this.host.cancelWake(subject);
-      if (!this.host.authorized(batch.latest)) {
-        this.host.audit({ kind: 'revoked', subject, eventId: batch.latest.eventId });
-        continue;
-      }
-      const rendering: Rendering<E> = { batch, cancelled: false, done: Promise.resolve() };
-      state.rendering = rendering;
-      // The render-start boundary is recoverable BEFORE the RPC: a restart
-      // then takes the fallback instead of asking the server a second time.
-      let committed = false;
-      try {
-        if (this.host.saveNow) this.host.saveNow(this.snapshot()); else this.persist();
-        await this.host.commit?.();
-        committed = true;
-      } catch (error) {
-        this.host.audit({ kind: 'persist-failed', subject, eventId: batch.latest.eventId, error: String(error) });
-      }
-      // Across that await the subject may have moved on: a retraction or a
-      // plain replacement cancelled this instance, or newer work took the
-      // slot. Only the instance that still owns the subject may act.
-      if (state.rendering !== rendering || rendering.cancelled) continue;
-      if (!committed) {
-        state.rendering = undefined;
-        batch.noRender = true; // cannot prove a render never started → fallback
-        state.batch = batch;
-        continue;
-      }
-      // Authority (grant, registration, binding) is re-checked after the
-      // await and immediately before dispatch: a server id reassigned to
-      // another endpoint meanwhile must not receive this batch's notices.
-      if (!this.host.authorized(batch.latest)) {
-        this.host.audit({ kind: 'revoked', subject, eventId: batch.latest.eventId });
-        state.rendering = undefined;
-        continue;
-      }
-      rendering.done = this.render(subject, state, rendering, agentName).finally(() => {
-        if (state.rendering === rendering) state.rendering = undefined;
-      });
-      work.push(rendering.done);
+    for (const subject of [...this.subjects.keys()]) {
+      // The handle is wrapped: a bare promise returned through `locked` would
+      // be flattened by `then`, holding the lock until the render settled —
+      // and the settlement itself needs the lock.
+      const started = await this.locked(() => this.freeze(subject, agentName));
+      if (started) work.push(started.done);
     }
     await Promise.all(work);
     this.persist();
+  }
+
+  /**
+   * Under the lock: decide whether `subject`'s batch renders for `agentName`,
+   * freeze it, make the render-start durable, re-check authority, and start
+   * the RPC. Returns the render's completion (shared by every assembly that
+   * waits on this batch, vector 25) or undefined when nothing was started.
+   */
+  private async freeze(subject: string, agentName: string): Promise<{ done: Promise<void> } | undefined> {
+    const state = this.subjects.get(subject);
+    if (!state || this.suspended) return undefined;
+    if (state.rendering) {
+      // Another assembly froze this batch; share its outcome (vector 25).
+      const rendering = state.rendering;
+      return (await this.host.audience(rendering.batch.latest)).includes(agentName) && state.rendering === rendering ? { done: rendering.done } : undefined;
+    }
+    const batch = state.batch;
+    if (!batch) return undefined;
+    // The audience lookup may spawn a fork. Under the lock no admission can
+    // move the subject on meanwhile; the identity check guards the host.
+    const audience = await this.host.audience(batch.latest);
+    if (!audience.includes(agentName) || state.batch !== batch || state.rendering) return undefined;
+    state.batch = undefined;
+    this.host.cancelWake(subject);
+    if (!this.host.authorized(batch.latest)) {
+      this.host.audit({ kind: 'revoked', subject, eventId: batch.latest.eventId });
+      return undefined;
+    }
+    const rendering: Rendering<E> = { batch, cancelled: false, done: Promise.resolve() };
+    state.rendering = rendering;
+    // The render-start boundary is recoverable BEFORE the RPC: a restart
+    // then takes the fallback instead of asking the server a second time.
+    try {
+      if (this.host.saveNow) this.host.saveNow(this.snapshot()); else this.persist();
+      await this.host.commit?.();
+    } catch (error) {
+      this.host.audit({ kind: 'persist-failed', subject, eventId: batch.latest.eventId, error: String(error) });
+      state.rendering = undefined;
+      batch.noRender = true; // cannot prove a render never started → fallback
+      state.batch = batch;
+      return undefined;
+    }
+    if (this.suspended) { state.rendering = undefined; state.batch = batch; return undefined; }
+    // Authority (grant, registration, binding) is re-checked immediately
+    // before dispatch: a server id reassigned to another endpoint during the
+    // commit must not receive this batch's notices.
+    if (!this.host.authorized(batch.latest)) {
+      this.host.audit({ kind: 'revoked', subject, eventId: batch.latest.eventId });
+      state.rendering = undefined;
+      return undefined;
+    }
+    rendering.done = this.render(subject, state, rendering, agentName);
+    return { done: rendering.done };
   }
 
   private async render(subject: string, state: SubjectState<E>, rendering: Rendering<E>, assemblingFor: string): Promise<void> {
@@ -574,37 +600,45 @@ export class PushCoalescer<E = unknown> {
       this.rendersInFlight.set(occurrence.serverId, (this.rendersInFlight.get(occurrence.serverId) ?? 0) + 1);
       try {
         const result = await this.host.render(occurrence, params);
-        if (rendering.cancelled) { this.host.audit({ kind: 'late-render', subject, eventId: occurrence.eventId, discarded: true }); return; }
-        validateCoalescedContent(result?.content, this.options.maxContentBytes);
+        if (rendering.cancelled) { this.host.audit({ kind: 'late-render', subject, eventId: occurrence.eventId, discarded: true }); }
+        else validateCoalescedContent(result?.content, this.options.maxContentBytes);
+        if (rendering.cancelled) throw new CancelledRender();
         content = result.content;
         timestamp = typeof result.timestamp === 'string' ? result.timestamp : new Date().toISOString();
         source = 'render';
       } catch (error) {
-        if (rendering.cancelled) return;
-        this.host.audit({ kind: 'render-failed', subject, eventId: occurrence.eventId, error: String(error) });
+        if (!(error instanceof CancelledRender)) this.host.audit({ kind: 'render-failed', subject, eventId: occurrence.eventId, error: String(error) });
       } finally {
         const left = (this.rendersInFlight.get(occurrence.serverId) ?? 1) - 1;
         if (left > 0) this.rendersInFlight.set(occurrence.serverId, left); else this.rendersInFlight.delete(occurrence.serverId);
       }
     }
-    if (rendering.cancelled) return;
-    // Rule 4: authority is re-checked at response.
-    if (!this.host.authorized(occurrence)) { this.host.audit({ kind: 'revoked', subject, eventId: occurrence.eventId }); return; }
-    this.host.audit({ kind: 'rendered', subject, eventId: occurrence.eventId, source, empty: content.length === 0 });
-    if (!content.length) return; // §5.2: nothing happened
-    const placement = await this.host.deliver({ ...occurrence, timestamp, content }, content, assemblingFor);
-    if (placement?.deferredId) {
-      // Landed in another agent's deferred queue (its turn is alive): still
-      // unread there, so it stays replaceable and withdrawable.
-      state.occupant = { eventId: occurrence.eventId, placement };
-      state.audienceAgent = placement.agent;
-      return;
-    }
-    // The materialized occurrence is consumed by the request being assembled.
-    state.history = 'some';
-    state.consumedEventId = occurrence.eventId;
-    state.occupant = undefined;
-    if (placement) state.audienceAgent = placement.agent;
+    // Settlement runs under the lock: between the RPC's return and the state
+    // update no admission can withdraw or replace what is being published.
+    await this.locked(async () => {
+      try {
+        if (rendering.cancelled || state.rendering !== rendering || this.suspended) return;
+        // Rule 4: authority is re-checked at response.
+        if (!this.host.authorized(occurrence)) { this.host.audit({ kind: 'revoked', subject, eventId: occurrence.eventId }); return; }
+        this.host.audit({ kind: 'rendered', subject, eventId: occurrence.eventId, source, empty: content.length === 0 });
+        if (!content.length) return; // §5.2: nothing happened
+        const placement = await this.host.deliver({ ...occurrence, timestamp, content }, content, assemblingFor);
+        if (placement?.deferredId) {
+          // Landed in another agent's deferred queue (its turn is alive): still
+          // unread there, so it stays replaceable and withdrawable.
+          state.occupant = { eventId: occurrence.eventId, placement };
+          state.audienceAgent = placement.agent;
+          return;
+        }
+        // The materialized occurrence is consumed by the request being assembled.
+        state.history = 'some';
+        state.consumedEventId = occurrence.eventId;
+        state.occupant = undefined;
+        if (placement) state.audienceAgent = placement.agent;
+      } finally {
+        if (state.rendering === rendering) state.rendering = undefined;
+      }
+    });
   }
 
   // ---------------------------------------------------------------------------
