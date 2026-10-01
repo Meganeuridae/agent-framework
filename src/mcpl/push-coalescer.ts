@@ -269,8 +269,10 @@ export class PushCoalescer<E = unknown> {
    * and an assembly never acts on a batch an admission moved on from.
    */
   private serial: Promise<unknown> = Promise.resolve();
-  /** Liveness after a failed freeze: a bounded, backed-off re-wake per subject. */
-  private readonly recovery = new Map<string, { timer: ReturnType<typeof setTimeout>; attempt: number }>();
+  /** Liveness after a failed freeze: a bounded, backed-off re-wake per
+   *  subject. `attempt` outlives the armed timer: it counts consecutive
+   *  failures and resets only on success or disposal of the pending work. */
+  private readonly recovery = new Map<string, { timer?: ReturnType<typeof setTimeout>; attempt: number }>();
   private suspended = false;
 
   constructor(private readonly host: CoalescerHost<E>, private readonly options: CoalescerOptions = {}) {
@@ -358,7 +360,7 @@ export class PushCoalescer<E = unknown> {
       // A producer retrying acknowledged work is also a chance to notice a
       // batch left asleep by a failed freeze: wake it now, without effects.
       const state = this.subjects.get(subject);
-      if (state?.batch && !state.rendering) { this.clearRecovery(subject); await this.host.wakeForBatch(state.batch.latest); }
+      if (state?.batch && !state.rendering) { this.disarmRecovery(subject); await this.host.wakeForBatch(state.batch.latest); }
       return this.acknowledge(coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId), duplicate, subject, occurrence.eventId);
     }
     const born = this.subjects.has(subject) ? undefined : (occurrence.initial && !occurrence.retract ? 'none' as const : 'unknown' as const);
@@ -425,25 +427,36 @@ export class PushCoalescer<E = unknown> {
 
   private scheduleRecovery(subject: string, state: SubjectState<E>): void {
     const prior = this.recovery.get(subject);
-    if (prior) clearTimeout(prior.timer);
+    if (prior?.timer) clearTimeout(prior.timer);
     const attempt = (prior?.attempt ?? 0) + 1;
     const base = this.options.recoveryBackoffMs ?? 1_000;
     const delay = Math.min(base * 2 ** (attempt - 1), base * 60);
-    const timer = setTimeout(() => {
-      this.recovery.delete(subject);
+    const entry = { attempt } as { timer?: ReturnType<typeof setTimeout>; attempt: number };
+    entry.timer = setTimeout(() => {
+      // Disarm, but keep the attempt count: a freeze that fails again backs
+      // off further. The count resets only on success or disposal.
+      if (this.recovery.get(subject) === entry) entry.timer = undefined;
       if (this.suspended || this.subjects.get(subject) !== state || !state.batch || state.rendering) return;
       // Authority and wake policy are the host's, re-evaluated at fire time.
       if (!this.host.authorized(state.batch.latest)) return;
-      this.host.audit({ kind: 'recovery-wake', subject, eventId: state.batch.latest.eventId, attempt });
+      this.host.audit({ kind: 'recovery-wake', subject, eventId: state.batch.latest.eventId, attempt, delayMs: delay });
       void this.host.wakeForBatch(state.batch.latest).catch(() => { /* audited by the host */ });
     }, delay);
-    (timer as { unref?: () => void }).unref?.();
-    this.recovery.set(subject, { timer, attempt });
+    (entry.timer as { unref?: () => void }).unref?.();
+    this.recovery.set(subject, entry);
   }
 
+  /** Disarm the timer only (a producer retry wakes now; the count stands). */
+  private disarmRecovery(subject: string): void {
+    const prior = this.recovery.get(subject);
+    if (prior?.timer) { clearTimeout(prior.timer); prior.timer = undefined; }
+  }
+
+  /** Success or disposal of the pending work: forget the failure series. */
   private clearRecovery(subject: string): void {
     const prior = this.recovery.get(subject);
-    if (prior) { clearTimeout(prior.timer); this.recovery.delete(subject); }
+    if (prior?.timer) clearTimeout(prior.timer);
+    this.recovery.delete(subject);
   }
 
   private dropBatches(subject: string, state: SubjectState<E>): boolean {

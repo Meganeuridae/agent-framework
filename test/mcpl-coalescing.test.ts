@@ -960,3 +960,32 @@ test('R16b: a producer retry re-wakes a batch left asleep by a failed freeze', a
   await f.turn();
   assert(f.lastRequest().includes('asleep_fallback'));
 });
+
+test('R17: a persistent storage outage backs off (1×, 2×, 4× …) and the series resets on recovery', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const coalescer = (f.framework as unknown as { pushCoalescer: { options: { recoveryBackoffMs?: number }; pendingBatches(): number; recovery: Map<string, { attempt: number; timer?: unknown }> } }).pushCoalescer;
+  coalescer.options.recoveryBackoffMs = 40;
+  const internals = f.framework as unknown as { pendingRequests: unknown[] };
+  const store = (f.framework as unknown as { store: { sync: () => void } }).store;
+  const orig = store.sync.bind(store);
+  let failing = false;
+  store.sync = () => { if (failing) throw new Error('EIO persistent'); orig(); };
+  const wakes: Array<{ attempt: number; delayMs: number }> = [];
+  f.framework.onTrace((e) => { if (e.type === 'mcpl:coalescing' && (e as { kind?: string }).kind === 'recovery-wake') wakes.push(e as never); });
+  await f.send('push/event', f.params('1', 'outage_fallback', { deferred: true, initial: true }));
+  failing = true;
+  f.alwaysRespond();
+  for (let i = 0; i < 3; i++) {
+    await f.framework.runUntilIdle(); // freeze fails → recovery scheduled
+    await eventually(() => internals.pendingRequests.length > 0, `recovery wake ${i + 1}`);
+  }
+  assert.deepEqual(wakes.map((w) => w.attempt), [1, 2, 3], 'consecutive failures count up');
+  assert.deepEqual(wakes.map((w) => w.delayMs), [40, 80, 160], 'and the delay doubles');
+  assert.equal(coalescer.pendingBatches(), 1);
+  assert(!f.context().includes('outage_fallback'));
+  failing = false; // storage recovers
+  await f.framework.runUntilIdle();
+  assert(f.lastRequest().includes('outage_fallback'), 'delivered once storage recovered');
+  assert.equal(coalescer.pendingBatches(), 0);
+  assert.equal(coalescer.recovery.size, 0, 'the failure series is forgotten on success');
+});
