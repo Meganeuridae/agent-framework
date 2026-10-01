@@ -778,3 +778,74 @@ test('R9 (kill, render-start): a render that may have run is not issued again af
   assert.equal(f.renders.length, 0, 'no second push/render');
   assert(f.lastRequest().includes('render_fallback'), 'the fallback is delivered instead');
 });
+
+// ---------------------------------------------------------------------------
+// Review round 6 (#197): the asynchronous barrier's failure and interleaving paths
+// ---------------------------------------------------------------------------
+
+test('R10: a retry after a failed commit is acknowledged only once the commit succeeds', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const store = (f.framework as unknown as { store: { sync: () => void } }).store;
+  const orig = store.sync.bind(store);
+  let syncs = 0; let failing = 1;
+  store.sync = () => { syncs++; if (failing > 0) { failing--; throw new Error('EIO simulated'); } orig(); };
+  const params = f.params('1', 'fallback', { deferred: true, initial: true });
+  const first = await f.send('push/event', params);
+  assert.equal(first.error?.code, -32000);
+  const before = syncs;
+  const retry = await f.send('push/event', params);
+  assert.equal(retry.result?.coalesce?.outcome, 'first', 'acknowledged on the retry');
+  assert(syncs > before, 'the retry committed; it did not just return the pending receipt');
+  // Still failing: the retry fails again rather than acknowledging.
+  failing = 1;
+  const again = await f.send('push/event', f.params('2', 'other', { key: 'k2', initial: true }));
+  assert.equal(again.error?.code, -32000);
+  const again2 = await f.send('push/event', f.params('2', 'other', { key: 'k2', initial: true }));
+  assert.equal(again2.result?.coalesce?.outcome, 'first');
+  assert.equal(f.framework.getAgent('agent')!.getContextManager().getAllMessages().filter((m) => JSON.stringify(m.content).includes('other')).length, 1, 'plain: delivered exactly once across the failed and successful acknowledgement');
+});
+
+/** Hold the host's next durability commit; returns a release function once it is held. */
+function holdNextCommit(f: Awaited<ReturnType<typeof fixture>>): Promise<() => void> {
+  const internals = f.framework as unknown as { commitCoalescingDurable: () => Promise<void> };
+  const orig = internals.commitCoalescingDurable.bind(internals);
+  return new Promise((held) => {
+    internals.commitCoalescingDurable = () => {
+      internals.commitCoalescingDurable = orig;
+      return new Promise<void>((resolve) => { held(() => orig().then(resolve, resolve)); });
+    };
+  });
+}
+
+test('R11: a retraction during the render-start commit wait is final; the batch is not restored', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', f.params('1', 'withdrawn_fallback', { deferred: true, initial: true }));
+  const held = holdNextCommit(f);
+  const run = f.framework.runUntilIdle();
+  const release = await held;
+  const r = await f.send('push/event', f.params('2', 'notice', { retract: true }));
+  assert.equal(r.result.coalesce.outcome, 'retracted');
+  release();
+  await run;
+  assert.equal(f.renders.length, 0);
+  assert.equal((f.framework as unknown as { pushCoalescer: { pendingBatches(): number } }).pushCoalescer.pendingBatches(), 0);
+  await f.turn();
+  assert.equal(f.renders.length, 0);
+  assert(!f.context().includes('withdrawn_fallback'));
+});
+
+test('R12: endpoint reassignment during the render-start commit wait never sends the batch to the new peer', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', f.params('1', 'old_fallback', { deferred: true, data: { secret: 'private_notice_data' } }));
+  const held = holdNextCommit(f);
+  const run = f.framework.runUntilIdle();
+  const release = await held;
+  const config = (f.framework as unknown as { mcplServerConfigs: Map<string, { url: string }> }).mcplServerConfigs.get('editor')!;
+  await f.framework.restartMcplServer('editor', { ...config, url: `${config.url}/reassigned` } as never);
+  await eventually(() => f.hostCaps.length === 2, 'reconnect to the new endpoint');
+  release();
+  await run;
+  assert.equal(f.renders.length, 0, 'no push/render to the new peer');
+  assert(!JSON.stringify(f.renders).includes('private_notice_data'));
+  assert(!f.context().includes('old_fallback'));
+});

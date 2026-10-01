@@ -246,7 +246,10 @@ export function validateCoalesceMember(
 
 export class PushCoalescer<E = unknown> {
   private readonly subjects = new Map<string, SubjectState<E>>();
-  private readonly receipts = new Map<string, { result: PushEventResult; at: number }>();
+  /** `committed`: the durability barrier succeeded after this receipt was
+   *  written. An uncommitted receipt deduplicates effects but is not an
+   *  acknowledgement until a commit succeeds. */
+  private readonly receipts = new Map<string, { result: PushEventResult; at: number; committed: boolean }>();
   private readonly retryWindowMs: number;
   private readonly maxSubjects: number;
   private readonly maxNotices: number;
@@ -284,10 +287,30 @@ export class PushCoalescer<E = unknown> {
   }
 
   receipt(serverId: string, binding: string, eventId: string): PushEventResult | undefined {
-    const key = coalescingReceiptKey(serverId, binding, eventId);
+    const entry = this.receiptEntry(coalescingReceiptKey(serverId, binding, eventId));
+    return entry && structuredClone(entry.result);
+  }
+
+  private receiptEntry(key: string): { result: PushEventResult; at: number; committed: boolean } | undefined {
     const entry = this.receipts.get(key);
     if (!entry) return undefined;
     if (this.now() - entry.at > this.retryWindowMs) { this.receipts.delete(key); return undefined; }
+    return entry;
+  }
+
+  /** Acknowledge a receipt: durable first. A receipt whose commit failed is
+   *  committed now (no effects are repeated); if that fails again, so does
+   *  the acknowledgement, and the producer retries once more. */
+  private async acknowledge(key: string, entry: { result: PushEventResult; at: number; committed: boolean }, subject: string, eventId: string): Promise<PushEventResult> {
+    if (!entry.committed) {
+      try {
+        await this.host.commit?.();
+        entry.committed = true;
+      } catch (error) {
+        this.host.audit({ kind: 'persist-failed', subject, eventId, error: String(error) });
+        throw new CoalesceError('eventId', 'host could not make the acceptance durable; retry', -32000);
+      }
+    }
     return structuredClone(entry.result);
   }
 
@@ -303,9 +326,9 @@ export class PushCoalescer<E = unknown> {
    */
   async accept(occurrence: CoalescedOccurrence<E>): Promise<PushEventResult> {
     if (this.suspended) throw new CoalesceError('serverId', 'host is stopping', -32000);
-    const duplicate = this.receipt(occurrence.serverId, occurrence.binding, occurrence.eventId);
-    if (duplicate) return duplicate;
     const subject = coalescingSubjectKey(occurrence.serverId, occurrence.binding, occurrence.scope, occurrence.key);
+    const duplicate = this.receiptEntry(coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId));
+    if (duplicate) return this.acknowledge(coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId), duplicate, subject, occurrence.eventId);
     const born = this.subjects.has(subject) ? undefined : (occurrence.initial && !occurrence.retract ? 'none' as const : 'unknown' as const);
     const state = this.subjectFor(subject, occurrence);
     const occupantUnread = this.refreshOccupant(state);
@@ -326,10 +349,10 @@ export class PushCoalescer<E = unknown> {
     state.touchedAt = this.now();
     const result: PushEventResult = { accepted: true, coalesce: { outcome, ...(priorEventId ? { priorEventId } : {}) } };
     const receiptKey = coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId);
-    const entry = { result: structuredClone(result), at: this.now() };
+    const entry = { result: structuredClone(result), at: this.now(), committed: false };
     try {
       this.host.recordReceipt?.({
-        key: receiptKey, ...structuredClone(entry), subject, ...(born ? { born } : {}),
+        key: receiptKey, result: entry.result, at: entry.at, subject, ...(born ? { born } : {}),
         batch: state.batch ? structuredClone({ latest: state.batch.latest as CoalescedOccurrence<unknown>, notices: state.batch.notices, dropped: state.batch.dropped }) : null,
       });
     } catch (error) {
@@ -341,16 +364,10 @@ export class PushCoalescer<E = unknown> {
     this.receipts.set(receiptKey, entry);
     this.prune();
     this.persist();
-    try {
-      await this.host.commit?.();
-    } catch (error) {
-      // Written but not durable: do not acknowledge. The in-memory receipt
-      // stays, so a retry while this process lives is deduplicated; after a
-      // kill nothing of it exists and the retry is a fresh acceptance.
-      this.host.audit({ kind: 'persist-failed', subject, eventId: occurrence.eventId, error: String(error) });
-      throw new CoalesceError('eventId', 'host could not make the acceptance durable; retry', -32000);
-    }
-    return structuredClone(result);
+    // Written but not yet durable: the in-memory receipt deduplicates a retry
+    // while this process lives, and the retry commits it (acknowledge); after
+    // a kill nothing of it exists and the retry is a fresh acceptance.
+    return this.acknowledge(receiptKey, entry, subject, occurrence.eventId);
   }
 
   private subjectFor(subject: string, occurrence: CoalescedOccurrence<E>): SubjectState<E> {
@@ -500,16 +517,32 @@ export class PushCoalescer<E = unknown> {
       state.rendering = rendering;
       // The render-start boundary is recoverable BEFORE the RPC: a restart
       // then takes the fallback instead of asking the server a second time.
+      let committed = false;
       try {
         if (this.host.saveNow) this.host.saveNow(this.snapshot()); else this.persist();
         await this.host.commit?.();
+        committed = true;
       } catch (error) {
         this.host.audit({ kind: 'persist-failed', subject, eventId: batch.latest.eventId, error: String(error) });
+      }
+      // Across that await the subject may have moved on: a retraction or a
+      // plain replacement cancelled this instance, or newer work took the
+      // slot. Only the instance that still owns the subject may act.
+      if (state.rendering !== rendering || rendering.cancelled) continue;
+      if (!committed) {
         state.rendering = undefined;
         batch.noRender = true; // cannot prove a render never started → fallback
         state.batch = batch;
+        continue;
       }
-      if (!state.rendering) { state.batch = batch; continue; }
+      // Authority (grant, registration, binding) is re-checked after the
+      // await and immediately before dispatch: a server id reassigned to
+      // another endpoint meanwhile must not receive this batch's notices.
+      if (!this.host.authorized(batch.latest)) {
+        this.host.audit({ kind: 'revoked', subject, eventId: batch.latest.eventId });
+        state.rendering = undefined;
+        continue;
+      }
       rendering.done = this.render(subject, state, rendering, agentName).finally(() => {
         if (state.rendering === rendering) state.rendering = undefined;
       });
@@ -576,7 +609,7 @@ export class PushCoalescer<E = unknown> {
     if (!snapshot || snapshot.version !== 1) return;
     const now = this.now();
     for (const [key, entry] of snapshot.receipts) {
-      if (now - entry.at <= this.retryWindowMs) this.receipts.set(key, entry);
+      if (now - entry.at <= this.retryWindowMs) this.receipts.set(key, { ...entry, committed: true });
     }
     for (const s of snapshot.subjects) {
       const state: SubjectState<E> = {
@@ -623,7 +656,7 @@ export class PushCoalescer<E = unknown> {
     const now = this.now();
     for (const r of records) {
       if (now - r.at > this.retryWindowMs) continue;
-      this.receipts.set(r.key, { result: r.result, at: r.at });
+      this.receipts.set(r.key, { result: r.result, at: r.at, committed: true });
       if (r.born && !this.subjects.has(r.subject)) this.subjects.set(r.subject, { history: r.born, touchedAt: now });
       // A birth fact is not proof the subject is still unread: the plain
       // occurrence this record acknowledged is in context (durable before the
