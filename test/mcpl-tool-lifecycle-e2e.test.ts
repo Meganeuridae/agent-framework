@@ -42,9 +42,12 @@ class Trigger implements Module {
   async handleToolCall(): Promise<ToolResult> { return { success: false, error: 'no tools', isError: true }; }
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     if (event.type === 'external-message') {
+      // Wake the named agents when the event names them (broadcast skips
+      // conversation forks), everyone otherwise.
+      const targets = (event as { targetAgents?: string[] }).targetAgents;
       return {
         addMessages: [{ participant: 'User', content: [{ type: 'text', text: 'go' }] }],
-        requestInference: true,
+        requestInference: targets ?? true,
       };
     }
     return {};
@@ -199,7 +202,8 @@ describe('tool lifecycle end to end (RFC-007)', () => {
   it('a provider that dies takes its classes with it, and calls to it are never reported (review #3, #4)', async () => {
     const internals = framework as unknown as {
       mcplServerRegistry: { getServer(id: string): unknown } | null;
-      describeToolForLifecycle(tool: string): { class: string[]; refused?: boolean };
+      describeToolForLifecycle(tool: string): { class: string[] };
+      conversationAgentHomes: Map<string, string>;
     };
     assert.deepEqual(internals.describeToolForLifecycle('prov--click').class, ['computer'], 'classed while alive');
 
@@ -207,10 +211,7 @@ describe('tool lifecycle end to end (RFC-007)', () => {
     await waitFor(() => internals.mcplServerRegistry?.getServer('prov') == null, 'provider removed from the registry');
 
     // #3: the stale declaration is gone — unclassed (restrictive) until re-listed.
-    const described = internals.describeToolForLifecycle('prov--click');
-    assert.deepEqual(described.class, []);
-    // #4: the host will refuse the call before executing it.
-    assert.equal(described.refused, true);
+    assert.deepEqual(internals.describeToolForLifecycle('prov--click').class, []);
 
     const before = readLog(obsLog).filter((e) => e.event === 'lifecycle').length;
     membrane.pushResponse(createMockResponse([
@@ -229,5 +230,37 @@ describe('tool lifecycle end to end (RFC-007)', () => {
     await new Promise((r) => setTimeout(r, 300));
     const after = readLog(obsLog).filter((e) => e.event === 'lifecycle').length;
     assert.equal(after, before, 'a call the host refused (provider gone) produces no events');
+  });
+  it('a host-tool refusal (conversation-bound channel guard) is never reported (re-review #1)', async () => {
+    const internals = framework as unknown as { conversationAgentHomes: Map<string, string> };
+    // Make scout a conversation fork bound to one channel: the guard in
+    // dispatchChannelToolCall refuses channel_open before it runs.
+    internals.conversationAgentHomes.set('scout', 'disc:guild:home');
+    try {
+      const before = readLog(obsLog).filter((e) => e.event === 'lifecycle').length;
+      const callsBefore = membrane.calls.length;
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'toolu_01EEEEEEEEEEEEEEEEEEEEEE', name: 'channel_open', input: { channelId: 'disc:guild:other' } },
+      ] as never, 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Refused.' }]));
+      framework.pushEvent({
+        type: 'external-message',
+        source: 'test',
+        content: [{ type: 'text', text: 'open another channel' }],
+        metadata: {},
+        triggerInference: true,
+        // Broadcast wakes skip conversation forks; address scout directly.
+        targetAgents: ['scout'],
+      } as unknown as ProcessEvent);
+      await waitFor(() => membrane.calls.length > callsBefore
+        && (membrane.lastStream?.receivedToolResults.length ?? 0) >= 1, 'the refused call answered');
+      const answer = JSON.stringify(membrane.lastStream!.receivedToolResults[0]);
+      assert.match(answer, /cannot open channels/, 'the guard did refuse it');
+      await new Promise((r) => setTimeout(r, 300));
+      const after = readLog(obsLog).filter((e) => e.event === 'lifecycle').length;
+      assert.equal(after, before, 'a refused host-tool call produces no events');
+    } finally {
+      internals.conversationAgentHomes.delete('scout');
+    }
   });
 });

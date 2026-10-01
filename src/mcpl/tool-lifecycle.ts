@@ -518,12 +518,8 @@ export interface ToolLifecycleHost {
   observers(): Iterable<ToolLifecycleObserver>;
   /** Host policy for one connection. */
   configFor(serverId: string): ToolLifecycleConfig | undefined;
-  /**
-   * Class and provider for a model-facing tool name, and whether the host
-   * will refuse the call before executing it (e.g. its provider is gone, or
-   * host tool policy denies it). A refused call produces no events.
-   */
-  describe(tool: string): { class: ToolClass[]; serverId?: string; serverTool?: string; refused?: boolean };
+  /** Class and provider for a model-facing tool name. */
+  describe(tool: string): { class: ToolClass[]; serverId?: string; serverTool?: string };
 }
 
 interface TrackedCall {
@@ -532,6 +528,8 @@ interface TrackedCall {
   call: ToolCallDescriptor;
   /** Connection id → transport epoch the opening went to. */
   openedTo: Map<string, number>;
+  /** `started` has been sent (open() ran and the call was not refused). */
+  opened: boolean;
   startedAt: number;
   /** The host could not obtain a result (a dispatch catch path). */
   failed: boolean;
@@ -589,17 +587,15 @@ export class ToolLifecycleEmitter {
   }
 
   /**
-   * A model-issued call is being dispatched for execution: send `started`
-   * to every connection that should see it. Called at the single dispatch
-   * point, keyed by (agent, model call id) — no trace-stream lookups, so two
-   * agents' identical short ids cannot cross. A call the host refuses before
-   * executing (describe().refused) produces no events at all.
+   * A model-issued call is about to be dispatched. Recorded, keyed by
+   * (agent, model call id) — never matched through the trace stream, so two
+   * agents' identical short ids cannot cross — but nothing is sent yet: the
+   * host may still refuse it (refuse()) before it executes.
    */
   register(agentName: string, inferenceId: string, call: { id: string; name: string; input: unknown }): void {
     if (!this.anyObserver()) return;
     const described = this.host.describe(call.name);
-    if (described.refused) return;
-    const tracked: TrackedCall = {
+    this.calls.set(callKey(agentName, call.id), {
       agentName,
       modelCallId: call.id,
       call: {
@@ -614,9 +610,36 @@ export class ToolLifecycleEmitter {
         input: call.input,
       },
       openedTo: new Map(),
+      opened: false,
       startedAt: this.now(),
       failed: false,
-    };
+    });
+  }
+
+  /**
+   * The host refused the call before executing it — its provider is gone,
+   * host tool policy denies it, a conversation-bound agent reached outside
+   * its channel. Called from the refusal site itself, synchronously within
+   * dispatch, so the call is forgotten before open() would send anything:
+   * a refused call produces no events (RFC-007 §3).
+   */
+  refuse(agentName: string, callId: string): void {
+    const key = callKey(agentName, callId);
+    const tracked = this.calls.get(key);
+    if (tracked && !tracked.opened) this.calls.delete(key);
+  }
+
+  /**
+   * Dispatch returned and the call was not refused: execution has begun.
+   * Send `started` to every connection that should see it. Refusal sites
+   * run synchronously inside dispatch, before this.
+   */
+  open(agentName: string, callId: string): void {
+    const key = callKey(agentName, callId);
+    const tracked = this.calls.get(key);
+    if (!tracked || tracked.opened) return;
+    tracked.opened = true;
+    tracked.startedAt = this.now();
     for (const observer of this.host.observers()) {
       let params: ToolLifecycleParams | null;
       try {
@@ -633,7 +656,8 @@ export class ToolLifecycleEmitter {
         /* best-effort */
       }
     }
-    if (tracked.openedTo.size > 0) this.calls.set(callKey(agentName, call.id), tracked);
+    // Nobody received an opening, so nobody is owed a terminal.
+    if (tracked.openedTo.size === 0) this.calls.delete(key);
   }
 
   /**
@@ -672,6 +696,11 @@ export class ToolLifecycleEmitter {
     if (this.calls.size === 0) return;
     const tracked = this.calls.get(callKey(agentName, callId));
     if (!tracked) return;
+    if (!tracked.opened) {
+      // Never opened (a path that bypassed open()): nothing was sent.
+      this.calls.delete(callKey(agentName, callId));
+      return;
+    }
     if (tracked.failed) this.terminate(tracked, 'failed');
     else this.terminate(tracked, 'completed', result?.isError === true || result?.success === false);
   }
@@ -687,7 +716,8 @@ export class ToolLifecycleEmitter {
     const ids = new Set(inferenceIds);
     for (const tracked of [...this.calls.values()]) {
       if (tracked.agentName === agentName && ids.has(tracked.call.inferenceId)) {
-        this.terminate(tracked, 'aborted');
+        if (tracked.opened) this.terminate(tracked, 'aborted');
+        else this.calls.delete(callKey(tracked.agentName, tracked.modelCallId));
       }
     }
   }

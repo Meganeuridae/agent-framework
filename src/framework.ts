@@ -8790,11 +8790,14 @@ export class AgentFramework {
             agent.enterWaitingForTools(event.calls, stream);
 
             for (const call of event.calls) {
-              // RFC-007: `started` goes out here, at the one dispatch point for
-              // model-issued calls, keyed by (agent, call id) and carrying this
-              // inference's id. Calls the host will refuse produce nothing.
+              // RFC-007: register at the one dispatch point for model-issued
+              // calls, keyed by (agent, call id) with this inference's id;
+              // `started` goes out once dispatch returns. Refusal sites inside
+              // dispatch run synchronously and call refuse() first, so a call
+              // the host refuses produces no events.
               this.toolLifecycleEmitter?.register(agent.name, outgoingInferenceId, call);
               this.dispatchToolCall(agent.name, call);
+              this.toolLifecycleEmitter?.open(agent.name, call.id);
             }
 
             // Speak-while-acting: route THIS round's prose to the locus NOW
@@ -10985,23 +10988,15 @@ export class AgentFramework {
    * host's table) applies only to tools the host implements; an MCPL tool's
    * class comes from an operator override or its server's declaration.
    */
-  private describeToolForLifecycle(tool: string): {
-    class: ToolClass[]; serverId?: string; serverTool?: string; refused?: boolean;
-  } {
+  private describeToolForLifecycle(tool: string): { class: ToolClass[]; serverId?: string; serverTool?: string } {
     const mcpl = this.resolveMcplTool(tool);
     if (mcpl) {
       const [serverId, prefix] = mcpl;
-      const serverTool = tool.slice(prefix.length + 2);
-      // The two refusals dispatchMcplToolCall makes before executing — the
-      // provider is gone, or host tool policy denies the tool. Mirrored here
-      // so such a call is never reported as started (RFC-007 §3).
-      const refused = !this.mcplServerRegistry?.getServer(serverId)
-        || !isToolAllowed(serverTool, this.mcplServerConfigs.get(serverId));
       const { classes } = resolveToolClass(tool, this.mcplToolClasses.get(tool), {
         overrides: this.toolClassOverrides,
         host: [],
       });
-      return { class: classes, serverId, serverTool, ...(refused ? { refused } : {}) };
+      return { class: classes, serverId, serverTool: tool.slice(prefix.length + 2) };
     }
     const { classes } = resolveToolClass(tool, undefined, {
       overrides: this.toolClassOverrides,
@@ -13365,6 +13360,8 @@ export class AgentFramework {
     const server = this.mcplServerRegistry!.getServer(serverId);
 
     if (!server) {
+      // RFC-007: refused before executing — no lifecycle events.
+      this.toolLifecycleEmitter?.refuse(agentName, call.id);
       this.pushEvent({
         type: 'tool-result',
         callId: call.id,
@@ -13377,6 +13374,7 @@ export class AgentFramework {
 
     const config = this.mcplServerConfigs.get(serverId);
     if (!isToolAllowed(toolName, config)) {
+      this.toolLifecycleEmitter?.refuse(agentName, call.id);
       this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: 'denied by tool policy' });
       this.pushEvent({
         type: 'tool-result',
@@ -13581,6 +13579,8 @@ export class AgentFramework {
     const home = this.conversationAgentHomes.get(agentName);
     if (home) {
       const reject = (error: string): void => {
+        // RFC-007: the guard refuses before the tool runs — no lifecycle events.
+        this.toolLifecycleEmitter?.refuse(agentName, call.id);
         this.emitTrace({
           type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id,
           error: `conversation agent ${agentName}: ${error}`,

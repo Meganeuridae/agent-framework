@@ -51,7 +51,6 @@ function harness(opts: {
   observers: ReturnType<typeof observer>[];
   config?: Record<string, ToolLifecycleConfig>;
   classes?: Record<string, ToolClass[]>;
-  refused?: Set<string>;
 }) {
   let clock = 1000;
   const emitter = new ToolLifecycleEmitter({
@@ -60,13 +59,28 @@ function harness(opts: {
     describe: (tool) => {
       const sep = tool.indexOf('--');
       const cls = opts.classes?.[tool] ?? ['shell'];
-      const refused = opts.refused?.has(tool) ? { refused: true } : {};
       return sep > 0
-        ? { class: cls, serverId: tool.slice(0, sep), serverTool: tool.slice(sep + 2), ...refused }
-        : { class: cls, ...refused };
+        ? { class: cls, serverId: tool.slice(0, sep), serverTool: tool.slice(sep + 2) }
+        : { class: cls };
     },
   }, () => clock);
   return { emitter, tick: (ms: number) => { clock += ms; } };
+}
+
+/**
+ * What the framework does at its dispatch point: register, run dispatch
+ * (whose refusal sites may call refuse()), then open.
+ */
+function dispatch(
+  emitter: ToolLifecycleEmitter,
+  agent: string,
+  inferenceId: string,
+  call: { id: string; name: string; input: unknown },
+  refusedByHost = false,
+): void {
+  emitter.register(agent, inferenceId, call);
+  if (refusedByHost) emitter.refuse(agent, call.id);
+  emitter.open(agent, call.id);
 }
 
 /** An Anthropic-shaped, provider-unique tool_use id. */
@@ -76,7 +90,7 @@ describe('ToolLifecycleEmitter', () => {
   test('started at dispatch, completed on result — isError from the result, never its content', () => {
     const o = observer('obs', [OBSERVE]);
     const { emitter, tick } = harness({ observers: [o] });
-    emitter.register('scout', 'inf_1', { id: TOOLU(1), name: 'prov--run', input: { cmd: 'make' } });
+    dispatch(emitter, 'scout', 'inf_1', { id: TOOLU(1), name: 'prov--run', input: { cmd: 'make' } });
     assert.deepEqual(o.sent.map((p) => p.phase), ['started']);
     tick(40);
     emitter.onResult('scout', TOOLU(1), { success: true, isError: true, data: 'SECRET-OUTPUT' } as never);
@@ -94,9 +108,9 @@ describe('ToolLifecycleEmitter', () => {
   test('review #6 — an error RESULT is completed+isError; only a marked dispatch failure is failed', () => {
     const o = observer('obs', [OBSERVE]);
     const { emitter } = harness({ observers: [o] });
-    emitter.register('scout', 'inf_1', { id: TOOLU(2), name: 'utils', input: {} });
+    dispatch(emitter, 'scout', 'inf_1', { id: TOOLU(2), name: 'utils', input: {} });
     emitter.onResult('scout', TOOLU(2), { success: false, isError: true });
-    emitter.register('scout', 'inf_1', { id: TOOLU(3), name: 'prov--run', input: {} });
+    dispatch(emitter, 'scout', 'inf_1', { id: TOOLU(3), name: 'prov--run', input: {} });
     emitter.markDispatchFailure('scout', TOOLU(3));
     emitter.onResult('scout', TOOLU(3), { success: false, isError: true });
     const terminals = o.sent.filter((p) => p.phase !== 'started');
@@ -108,18 +122,32 @@ describe('ToolLifecycleEmitter', () => {
 
   test('review #4 — a call the host refuses before executing (provider gone, policy) produces no events', () => {
     const o = observer('obs', [OBSERVE, INPUTS], rules([{ match: {}, input: true }]));
-    const { emitter } = harness({ observers: [o], config: { obs: DEFAULT_INPUTS }, refused: new Set(['gone--click']) });
-    emitter.register('scout', 'inf_1', { id: TOOLU(4), name: 'gone--click', input: { x: 1 } });
+    const { emitter } = harness({ observers: [o], config: { obs: DEFAULT_INPUTS } });
+    dispatch(emitter, 'scout', 'inf_1', { id: TOOLU(4), name: 'gone--click', input: { x: 1 } }, true);
     emitter.onResult('scout', TOOLU(4), { success: false, isError: true });
     assert.equal(o.sent.length, 0);
     assert.equal(emitter.openCount, 0);
   });
 
+  test('re-review #1 — a host-tool refusal (conversation-bound channel guard) produces no events', () => {
+    const o = observer('obs', [OBSERVE]);
+    const { emitter } = harness({ observers: [o], classes: { channel_open: ['comms'] } });
+    dispatch(emitter, 'fork-1', 'inf_1', { id: TOOLU(40), name: 'channel_open', input: { channelId: 'x' } }, true);
+    emitter.onResult('fork-1', TOOLU(40), { success: false, isError: true });
+    assert.equal(o.sent.length, 0, 'never reported as started or completed');
+    // refuse() after the opening went out changes nothing: refusal is only
+    // meaningful before execution, and the call is then paired normally.
+    dispatch(emitter, 'scout', 'inf_2', { id: TOOLU(41), name: 'prov--a', input: {} });
+    emitter.refuse('scout', TOOLU(41));
+    emitter.onResult('scout', TOOLU(41), { success: true });
+    assert.deepEqual(o.sent.map((p) => p.phase), ['started', 'completed']);
+  });
+
   test('review #2 — two agents with the same short call id never cross', () => {
     const o = observer('obs', [OBSERVE]);
     const { emitter } = harness({ observers: [o] });
-    emitter.register('alice', 'inf_a', { id: 'call_0', name: 'prov--a', input: {} });
-    emitter.register('bob', 'inf_b', { id: 'call_0', name: 'prov--b', input: {} });
+    dispatch(emitter, 'alice', 'inf_a', { id: 'call_0', name: 'prov--a', input: {} });
+    dispatch(emitter, 'bob', 'inf_b', { id: 'call_0', name: 'prov--b', input: {} });
     emitter.markDispatchFailure('bob', 'call_0');
     emitter.onResult('bob', 'call_0', { success: false, isError: true });
     emitter.onResult('alice', 'call_0', { success: true });
@@ -133,9 +161,9 @@ describe('ToolLifecycleEmitter', () => {
   test('review #5 — a stream end aborts only its own inference ids, never a successor\'s calls', () => {
     const o = observer('obs', [OBSERVE]);
     const { emitter } = harness({ observers: [o] });
-    emitter.register('scout', 'inf_old', { id: TOOLU(5), name: 'prov--a', input: {} });
-    emitter.register('scout', 'inf_new', { id: TOOLU(6), name: 'prov--b', input: {} });
-    emitter.register('other', 'inf_x', { id: TOOLU(7), name: 'prov--c', input: {} });
+    dispatch(emitter, 'scout', 'inf_old', { id: TOOLU(5), name: 'prov--a', input: {} });
+    dispatch(emitter, 'scout', 'inf_new', { id: TOOLU(6), name: 'prov--b', input: {} });
+    dispatch(emitter, 'other', 'inf_x', { id: TOOLU(7), name: 'prov--c', input: {} });
     emitter.abortOpen('scout', ['inf_old']);
     assert.deepEqual(o.sent.filter((p) => p.phase === 'aborted').map((p) => p.tool), ['prov--a']);
     emitter.onResult('scout', TOOLU(6), { success: true });
@@ -148,8 +176,8 @@ describe('ToolLifecycleEmitter', () => {
   test('parallel calls pair by toolCallId', () => {
     const o = observer('obs', [OBSERVE]);
     const { emitter } = harness({ observers: [o] });
-    emitter.register('scout', 'inf_1', { id: TOOLU(8), name: 'prov--a', input: {} });
-    emitter.register('scout', 'inf_1', { id: TOOLU(9), name: 'prov--b', input: {} });
+    dispatch(emitter, 'scout', 'inf_1', { id: TOOLU(8), name: 'prov--a', input: {} });
+    dispatch(emitter, 'scout', 'inf_1', { id: TOOLU(9), name: 'prov--b', input: {} });
     emitter.onResult('scout', TOOLU(9), { success: true });
     emitter.onResult('scout', TOOLU(8), { success: true });
     assert.deepEqual(o.sent.map((p) => `${p.toolCallId}:${p.phase}`), [
@@ -161,7 +189,7 @@ describe('ToolLifecycleEmitter', () => {
     const a = observer('a', [OBSERVE]);
     const b = observer('b', [OBSERVE, INPUTS]);
     const { emitter } = harness({ observers: [a, b] });
-    emitter.register('scout', 'inf_1', { id: TOOLU(10), name: 'prov--a', input: {} });
+    dispatch(emitter, 'scout', 'inf_1', { id: TOOLU(10), name: 'prov--a', input: {} });
     a.grant = a.grant.without(OBSERVE);
     b.grant = b.grant.without(INPUTS);
     emitter.onResult('scout', TOOLU(10), { success: true });
@@ -172,7 +200,7 @@ describe('ToolLifecycleEmitter', () => {
   test('review #7 — a reconnected observer never gets a terminal for an opening its old transport saw', () => {
     const o = observer('obs', [OBSERVE]);
     const { emitter } = harness({ observers: [o] });
-    emitter.register('scout', 'inf_1', { id: TOOLU(11), name: 'prov--a', input: {} });
+    dispatch(emitter, 'scout', 'inf_1', { id: TOOLU(11), name: 'prov--a', input: {} });
     o.transportEpoch++; // reconnect; grant re-established
     emitter.onResult('scout', TOOLU(11), { success: true });
     assert.deepEqual(o.sent.map((p) => p.phase), ['started']);
@@ -181,7 +209,7 @@ describe('ToolLifecycleEmitter', () => {
   test('a filter change mid-call does not suppress the terminal (§6.5)', () => {
     const o = observer('obs', [OBSERVE]);
     const { emitter } = harness({ observers: [o] });
-    emitter.register('scout', 'inf_1', { id: TOOLU(12), name: 'prov--a', input: {} });
+    dispatch(emitter, 'scout', 'inf_1', { id: TOOLU(12), name: 'prov--a', input: {} });
     o.toolObserveFilter = [];
     emitter.onResult('scout', TOOLU(12), { success: true });
     assert.deepEqual(o.sent.map((p) => p.phase), ['started', 'completed']);
@@ -191,7 +219,7 @@ describe('ToolLifecycleEmitter', () => {
     const early = observer('early', [OBSERVE]);
     const late = observer('late', []);
     const { emitter } = harness({ observers: [early, late] });
-    emitter.register('scout', 'inf_1', { id: TOOLU(13), name: 'prov--a', input: {} });
+    dispatch(emitter, 'scout', 'inf_1', { id: TOOLU(13), name: 'prov--a', input: {} });
     late.grant = new CapabilityGrant(new Set([OBSERVE]), []);
     emitter.onResult('scout', TOOLU(13), { success: true });
     assert.deepEqual(early.sent.map((p) => p.phase), ['started', 'completed']);
@@ -202,7 +230,7 @@ describe('ToolLifecycleEmitter', () => {
     const o = observer('obs', [OBSERVE]);
     const { emitter } = harness({ observers: [o] });
     const run = (id: string) => {
-      emitter.register('scout', 'inf', { id, name: 'prov--a', input: {} });
+      dispatch(emitter, 'scout', 'inf', { id, name: 'prov--a', input: {} });
       emitter.onResult('scout', id, { success: true });
     };
     run('call_0');
@@ -221,7 +249,7 @@ describe('ToolLifecycleEmitter', () => {
   test('inert while nothing observes: register tracks nothing', () => {
     const o = observer('obs', []);
     const { emitter } = harness({ observers: [o] });
-    emitter.register('scout', 'inf', { id: TOOLU(15), name: 'prov--a', input: {} });
+    dispatch(emitter, 'scout', 'inf', { id: TOOLU(15), name: 'prov--a', input: {} });
     assert.equal(emitter.openCount, 0);
   });
 
@@ -237,7 +265,7 @@ describe('ToolLifecycleEmitter', () => {
       classes: { 'computer--click': ['computer'], 'chat--send': ['comms'], 'blender--execute': [] },
     });
     const go = (id: string, name: string, input: unknown) => {
-      emitter.register('scout', 'inf', { id, name, input });
+      dispatch(emitter, 'scout', 'inf', { id, name, input });
       emitter.onResult('scout', id, { success: true });
     };
     go(TOOLU(20), 'computer--click', { x: 1, y: 2, button: 'left' });
