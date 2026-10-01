@@ -225,6 +225,23 @@ export interface FrameworkConfig {
    */
   toolResultInlineMaxChars?: number;
 
+  /**
+   * MCPL RFC-008 operator class overrides: RFC-007 §6.2 patterns over the
+   * model-facing tool name → classes. Highest-precedence source of a tool's
+   * effective class (first matching pattern wins); replaces, never merges
+   * with, what the providing server declared. Use it to correct or tighten a
+   * misclassed tool.
+   */
+  toolClassOverrides?: Record<string, string[]>;
+
+  /**
+   * MCPL RFC-008 host knowledge for tools the EMBEDDING host implements (its
+   * own modules), same shape as toolClassOverrides. Consulted before the
+   * framework's built-in table and never for MCPL-provided tools, whose
+   * class comes from an override or their server's `_meta["mcpl/class"]`.
+   */
+  hostToolClasses?: Record<string, string[]>;
+
   /** Inference routing policy for server-initiated inference (optional). */
   inferenceRouting?: InferenceRoutingPolicy;
 

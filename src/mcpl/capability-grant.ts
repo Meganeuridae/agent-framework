@@ -48,6 +48,9 @@ const VOCABULARY: CapNode = {
   modelInfo: null,
   inferenceRequest: { streaming: null },
   inferenceLifecycle: null,
+  // RFC-007: metadata observation and argument observation are separate
+  // leaves, separately granted (observation never bundles content).
+  toolLifecycle: { observe: null, inputs: null },
   contextHooks: {
     beforeInference: {
       observe: null,
@@ -217,8 +220,25 @@ export function capabilityPatternMatches(pattern: string, path: string): boolean
 // The grant
 // ============================================================================
 
-/** §13.4: denied unless explicitly enabled by host config. */
-const DENY_BY_DEFAULT: readonly string[] = ['contextHooks.beforeInference.inject.system'];
+/** §13.4: denied unless explicitly enabled by host config. RFC-007 adds both
+ *  tool-lifecycle leaves: observing other servers' tool use (and, above all,
+ *  their arguments) is an operator decision, never a default. */
+const DENY_BY_DEFAULT: readonly string[] = [
+  'contextHooks.beforeInference.inject.system',
+  'toolLifecycle.observe',
+  'toolLifecycle.inputs',
+];
+
+/**
+ * RFC-007: stating a `toolLifecycle.observe` / `.inputs` policy block in the
+ * server's config is itself the explicit grant of that path — the operator
+ * who wrote a narrowing meant to grant what it narrows.
+ */
+function configGrants(config: Pick<McplServerConfig, 'toolLifecycle'>, path: string): boolean {
+  if (path === 'toolLifecycle.observe') return config.toolLifecycle?.observe !== undefined;
+  if (path === 'toolLifecycle.inputs') return config.toolLifecycle?.inputs !== undefined;
+  return false;
+}
 
 export class CapabilityGrant {
   /** Exact granted paths (already expanded — no patterns stored). */
@@ -286,7 +306,7 @@ export class CapabilityGrant {
  */
 export function computeGrant(
   capabilities: McplCapabilities | null,
-  config: Pick<McplServerConfig, 'enabledCapabilities'>,
+  config: Pick<McplServerConfig, 'enabledCapabilities' | 'toolLifecycle'>,
   opts?: {
     /** §5.1: `tools` is sourced from the OUTER standard MCP
      *  `capabilities.tools` — pass its presence here. The experimental
@@ -304,15 +324,32 @@ export function computeGrant(
     !!config.enabledCapabilities?.some((pat) => capabilityPatternMatches(pat, path));
 
   for (const path of advertised) {
-    if (DENY_BY_DEFAULT.includes(path) && !explicitlyEnabled(path)) {
+    if (DENY_BY_DEFAULT.includes(path) && !explicitlyEnabled(path) && !configGrants(config, path)) {
       denied.push(path);
       console.error(
-        `[mcpl] "${path}" advertised but DENIED BY DEFAULT (SPEC §13.4) — ` +
-          `grant it explicitly via enabledCapabilities if intended`,
+        `[mcpl] "${path}" advertised but DENIED BY DEFAULT (${path.startsWith('toolLifecycle.') ? 'RFC-007' : 'SPEC §13.4'}) — ` +
+          `grant it explicitly via enabledCapabilities${path.startsWith('toolLifecycle.') ? ' or a toolLifecycle policy block' : ''} if intended`,
       );
       continue;
     }
     granted.add(path);
+  }
+
+  // RFC-007 §4.1/§4.3 diagnostics — loud, because each is a grant that
+  // silently delivers less than the operator probably meant.
+  if (granted.has('toolLifecycle.inputs')) {
+    if (!granted.has('toolLifecycle.observe')) {
+      console.error('[mcpl] toolLifecycle.inputs granted without toolLifecycle.observe — delivers nothing (RFC-007 §4.1)');
+    }
+    const n = config.toolLifecycle?.inputs;
+    const hasTerm = !!n && ((Array.isArray(n.tools) && n.tools.length > 0)
+      || n.classes === 'default' || (Array.isArray(n.classes) && n.classes.length > 0));
+    if (!hasTerm) {
+      console.error(
+        '[mcpl] toolLifecycle.inputs granted with no tools/classes narrowing — treated as narrowed to NO tools; ' +
+          'inputs is never unconditional (RFC-007 §4.3)',
+      );
+    }
   }
 
   return new CapabilityGrant(granted, denied.sort());

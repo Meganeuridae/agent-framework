@@ -145,6 +145,10 @@ export interface McplCapabilities {
   /** Server consumes inference/lifecycle notifications (§10.5). */
   inferenceLifecycle?: boolean;
 
+  /** RFC-007 tool lifecycle: observe (metadata) and inputs (requested
+   *  argument fields). `true` = both leaves. */
+  toolLifecycle?: boolean | { observe?: boolean; inputs?: boolean };
+
   /** Server supports model/info requests */
   modelInfo?: boolean;
 
@@ -170,6 +174,10 @@ export interface McplHostCapabilities {
   };
   inferenceRequest?: boolean | { streaming?: boolean };
   inferenceLifecycle?: boolean;
+
+  /** RFC-007 tool lifecycle: observe (metadata) and inputs (requested
+   *  argument fields). `true` = both leaves. */
+  toolLifecycle?: boolean | { observe?: boolean; inputs?: boolean };
   modelInfo?: boolean;
   featureSets?: boolean;
   channels?: boolean | McplChannelCapabilities;
@@ -389,6 +397,17 @@ export interface McplServerConfig {
    *  cumulative per-server byte budget (reference-fetcher.ts defaults apply
    *  when absent). */
   autofetch?: { maxBytes?: number; maxTotalBytes?: number };
+
+  /**
+   * RFC-007 tool lifecycle policy for this server: narrowing for the
+   * `toolLifecycle.observe` and `toolLifecycle.inputs` grants, and the
+   * `input` size bound. Both paths are DENIED BY DEFAULT; stating a key here
+   * (or naming the path in enabledCapabilities) is the explicit grant.
+   * `inputs` without a `tools` or `classes` term delivers no arguments, and
+   * `comms` or unclassed tools never carry arguments whatever it says.
+   * See src/mcpl/tool-lifecycle.ts.
+   */
+  toolLifecycle?: import('./tool-lifecycle.js').ToolLifecycleConfig;
 }
 
 // ============================================================================
@@ -1200,6 +1219,13 @@ export const McplMethod = {
   // Inference lifecycle (Host → Server, Notification) — §10.5, replaces
   // context/afterInference. Metadata only; BEST-EFFORT delivery.
   InferenceLifecycle: 'inference/lifecycle',
+
+  // Tool lifecycle (RFC-007). tools/lifecycle is Host → Server,
+  // Notification, metadata plus (under its own grant) requested argument
+  // fields — never results. tools/observe is Server → Host, Request: the
+  // server's filter over what it is sent (interest, never authority).
+  ToolsLifecycle: 'tools/lifecycle',
+  ToolsObserve: 'tools/observe',
 
   // Server manifest changes (§17). manifestChanged is S→H Notification —
   // an opaque revision plus changed domains, NO payload, deliberately
