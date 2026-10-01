@@ -7379,7 +7379,13 @@ export class AgentFramework {
     try {
       coalescer.restore(this.store.getStateJson(COALESCING_STATE_ID) as CoalescingSnapshot | null);
       const recent = this.store.getStateJson(COALESCING_RECENT_ID) as CoalescingReceiptRecord[] | null;
-      if (Array.isArray(recent)) coalescer.restoreReceipts(recent);
+      if (Array.isArray(recent)) {
+        coalescer.restoreReceipts(recent);
+        // Until the next snapshot flush checkpoints the recovered state, these
+        // records are its only durable form: keep them in the writable buffer
+        // so the next acceptance appends to them instead of replacing them.
+        this.coalescingRecentReceipts = recent;
+      }
     } catch (err) {
       console.error('[coalescing] could not restore coalescing state; starting with unknown history:', err);
     }

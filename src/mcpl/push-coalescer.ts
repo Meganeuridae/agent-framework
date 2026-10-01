@@ -502,11 +502,17 @@ export class PushCoalescer<E = unknown> {
     for (const [subject, state] of this.subjects) {
       if (state.rendering) {
         // Another assembly froze this batch; share its outcome (vector 25).
-        if ((await this.host.audience(state.rendering.batch.latest)).includes(agentName)) work.push(state.rendering.done);
+        const rendering = state.rendering;
+        if ((await this.host.audience(rendering.batch.latest)).includes(agentName) && state.rendering === rendering) work.push(rendering.done);
         continue;
       }
       const batch = state.batch;
-      if (!batch || !(await this.host.audience(batch.latest)).includes(agentName)) continue;
+      if (!batch) continue;
+      const audience = await this.host.audience(batch.latest);
+      // The audience lookup may spawn a fork and awaits: a retraction, a
+      // replacement or another assembly can move the subject on meanwhile.
+      // Only the batch that is STILL the subject's pending batch is frozen.
+      if (!audience.includes(agentName) || state.batch !== batch || state.rendering) continue;
       state.batch = undefined;
       this.host.cancelWake(subject);
       if (!this.host.authorized(batch.latest)) {

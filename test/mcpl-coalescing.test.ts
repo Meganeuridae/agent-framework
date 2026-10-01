@@ -849,3 +849,39 @@ test('R12: endpoint reassignment during the render-start commit wait never sends
   assert(!JSON.stringify(f.renders).includes('private_notice_data'));
   assert(!f.context().includes('old_fallback'));
 });
+
+// ---------------------------------------------------------------------------
+// Review round 7 (#197): neighbours of the round-6 fixes
+// ---------------------------------------------------------------------------
+
+test('R13: a retraction during the audience lookup is final; the stale batch is not frozen', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', f.params('1', 'withdrawn_fallback', { deferred: true, initial: true }));
+  const internals = f.framework as unknown as { coalescedAudience: (occ: unknown) => Promise<string[]> };
+  const orig = internals.coalescedAudience.bind(internals);
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    internals.coalescedAudience = (occ) => { internals.coalescedAudience = orig; return new Promise<string[]>((res) => { release = () => orig(occ).then(res); resolve(); }); };
+  });
+  const run = f.framework.runUntilIdle();
+  await held;
+  const r = await f.send('push/event', f.params('2', 'notice', { retract: true }));
+  assert.equal(r.result.coalesce.outcome, 'retracted');
+  release();
+  await run;
+  assert.equal(f.renders.length, 0, 'the withdrawn batch was not rendered');
+  assert(!f.context().includes('withdrawn_fallback') && !f.lastRequest().includes('document_diff'));
+});
+
+test('R14: two consecutive crash windows with an acceptance in between keep both recovered batches', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', f.params('a', 'first_window_fallback', { deferred: true, key: 'A' }));
+  await crash(f); await f.create();
+  await f.send('push/event', f.params('b', 'second_window_fallback', { deferred: true, key: 'B' }));
+  await crash(f); await f.create();
+  const retryA = await f.send('push/event', f.params('a', 'first_window_fallback', { deferred: true, key: 'A' }));
+  assert.equal(retryA.result?.coalesce?.outcome, 'first', "A's receipt survived the second window");
+  await f.framework.runUntilIdle();
+  const req = f.lastRequest();
+  assert(req.includes('first_window_fallback') && req.includes('second_window_fallback'), 'both recovered batches delivered');
+});
