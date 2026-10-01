@@ -173,6 +173,18 @@ describe('ToolLifecycleEmitter', () => {
     assert.equal(emitter.openCount, 1, "the other agent's call stays open");
   });
 
+  test('re-review #2 — durationMs counts from before dispatch, so synchronous work inside dispatch is included', () => {
+    const o = observer('obs', [OBSERVE]);
+    const { emitter, tick } = harness({ observers: [o] });
+    emitter.register('scout', 'inf_1', { id: TOOLU(42), name: 'sleep', input: {} });
+    tick(25); // a synchronous tool doing its work inside dispatch
+    emitter.open('scout', TOOLU(42));
+    tick(5); // the queued result waiting to be processed
+    emitter.onResult('scout', TOOLU(42), { success: true });
+    assert.deepEqual(o.sent.map((p) => p.phase), ['started', 'completed']);
+    assert.equal(o.sent[1].durationMs, 30);
+  });
+
   test('parallel calls pair by toolCallId', () => {
     const o = observer('obs', [OBSERVE]);
     const { emitter } = harness({ observers: [o] });

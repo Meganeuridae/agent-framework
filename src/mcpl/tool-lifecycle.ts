@@ -611,6 +611,8 @@ export class ToolLifecycleEmitter {
       },
       openedTo: new Map(),
       opened: false,
+      // Taken before dispatch, so durationMs includes work a synchronous
+      // tool does inside dispatch (its `started` is sent only after).
       startedAt: this.now(),
       failed: false,
     });
@@ -639,7 +641,6 @@ export class ToolLifecycleEmitter {
     const tracked = this.calls.get(key);
     if (!tracked || tracked.opened) return;
     tracked.opened = true;
-    tracked.startedAt = this.now();
     for (const observer of this.host.observers()) {
       let params: ToolLifecycleParams | null;
       try {
