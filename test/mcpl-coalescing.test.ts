@@ -92,8 +92,8 @@ async function fixture(options: { server?: Record<string, unknown>; framework?: 
     renderer: (fn: typeof renderer) => { renderer = fn; },
     /** Serialized context of the primary agent. */
     context: (agent = 'agent') => JSON.stringify(framework.getAgent(agent)!.getContextManager().getAllMessages()),
-    /** Serialized last model request. */
-    lastRequest: () => JSON.stringify(membrane.calls.at(-1)),
+    /** Serialized messages of the last model request (tool descriptions excluded). */
+    lastRequest: () => JSON.stringify((membrane.calls.at(-1) as { messages?: unknown } | undefined)?.messages),
     turn: async () => { membrane.pushResponse(ok()); await framework.runUntilIdle(); },
     /** Every subsequent model call gets a complete 'ok' response (multi-turn tests). */
     alwaysRespond: () => {
@@ -584,4 +584,155 @@ test('conversation forks: a channel-scoped edit follows the routed fork and pins
   assert(f.lastRequest().includes('fork_latest') && !f.lastRequest().includes('fork_original'));
   assert(!f.context().includes('fork_latest'), 'the trunk never sees channel traffic');
   assert.equal(f.published.at(-1)?.channelId, 'chat');
+});
+
+// ---------------------------------------------------------------------------
+// Review round 1 (#197): Greptile G1–G15, Codex C1–C3
+// ---------------------------------------------------------------------------
+
+test('C1: a channel-scoped render result is dropped when channels.incoming is revoked mid-render', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const { CapabilityGrant } = await import('../src/mcpl/capability-grant.js');
+  let release!: (v: unknown) => void;
+  const started = new Promise<void>((resolve) => { f.renderer(() => { resolve(); return new Promise((r) => { release = r; }); }); });
+  await f.send('push/event', f.params('1', 'fallback', { deferred: true, channelId: 'chat', key: 'activity' }));
+  const run = f.framework.runUntilIdle();
+  await started;
+  const conn = (f.framework as unknown as { mcplServerRegistry: { getServer(id: string): { establishGrant(g: unknown): void; grant: unknown } } }).mcplServerRegistry.getServer('editor');
+  conn.establishGrant(new CapabilityGrant(new Set(['pushEvents']), []));
+  release({ content: [{ type: 'text', text: 'revoked_render' }] });
+  await run;
+  assert(!f.context().includes('revoked_render') && !f.context().includes('fallback'));
+});
+
+test('C2 / vector 42: reassigning the server id to another endpoint starts a new binding', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const a = await f.send('push/event', f.params('E', 'from_endpoint_a', { key: 'K', initial: true }));
+  assert.equal(a.result.coalesce.outcome, 'first');
+  const config = (f.framework as unknown as { mcplServerConfigs: Map<string, { url: string }> }).mcplServerConfigs.get('editor')!;
+  await f.framework.restartMcplServer('editor', { ...config, url: `${config.url}/reassigned` } as never);
+  await eventually(() => f.hostCaps.length === 2, 'reconnect to the new endpoint');
+  const b = await f.send('push/event', f.params('E', 'from_endpoint_b', { key: 'K', initial: true }));
+  assert.equal(b.result.coalesce.outcome, 'first', "B's reuse of A's event id is a new occurrence");
+  const b2 = await f.send('push/event', f.params('E2', 'from_endpoint_b_2', { key: 'K' }));
+  assert.equal(b2.result.coalesce.outcome, 'replaced');
+  assert.equal(b2.result.coalesce.priorEventId, 'E');
+  assert(f.context().includes('from_endpoint_a'), "A's unread content is not touched by B");
+  assert(f.context().includes('from_endpoint_b_2') && !f.context().includes('from_endpoint_b"'));
+});
+
+test('C3: a replacement follows the prior delivery into its fork, never into a fresh one', async (t) => {
+  const f = await fixture({ framework: { conversations: { templateAgent: 'agent', bind: { channel: 'always' }, trigger: { channel: 'always' } } } as never }); t.after(f.close); await f.register();
+  await f.send('channels/incoming', { messages: [f.channel('c', 'fork_original', { initial: true })] });
+  const router = (f.framework as unknown as { conversationRouter: { getBinding(id: string): { agentName: string } | undefined; unbind(id: string): void } }).conversationRouter;
+  const g1 = router.getBinding('chat')!.agentName;
+  router.unbind('chat');
+  const edit = await f.send('push/event', f.params('e', 'fork_edit', { channelId: 'chat', key: 'message:m' }));
+  assert.equal(edit.result.coalesce.outcome, 'replaced');
+  assert.equal(router.getBinding('chat'), undefined, 'no fresh fork was spawned for the edit');
+  const g1ctx = JSON.stringify(f.framework.getAgent(g1)!.getContextManager().getAllMessages());
+  assert(g1ctx.includes('fork_edit') && !g1ctx.includes('fork_original'));
+});
+
+test('G1: malformed content on a coalesced channel item fails that item only', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const bad = { ...f.channel('bad', 'x', { initial: true }, 'chat', 'b'), content: 'not-an-array' };
+  const r = await f.send('channels/incoming', { messages: [bad, f.channel('good', 'good_sibling', { initial: true }, 'chat', 'g')] });
+  assert.deepEqual(r.result.results.map((x: { accepted: boolean }) => x.accepted), [false, true]);
+  assert.equal(r.result.results[0].reason, 'coalesce_invalid');
+  const badPush = await f.send('push/event', { ...f.params('p', 'x'), payload: { content: [{ type: 'text' }] } });
+  assert.equal(badPush.error.code, -32602);
+});
+
+test('G3/G5: a deferred channel-scoped push renders with its feature set and wakes with its channel', async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => true } }); t.after(f.close); await f.register();
+  await f.send('push/event', { ...f.params('1', 'fallback', { deferred: true, channelId: 'chat', key: 'activity' }), origin: { authorId: 'u', authorName: 'User' } });
+  const internals = f.framework as unknown as { pendingRequests: Array<{ channelId?: string; counterparty?: string }> };
+  assert.equal(internals.pendingRequests[0]?.channelId, 'chat');
+  assert.equal(internals.pendingRequests[0]?.counterparty, 'editor:user:u');
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders[0]?.featureSet, 'doc');
+  assert.equal(f.renders[0]?.channelId, 'chat');
+  assert.equal(f.published.at(-1)?.channelId, 'chat', 'the reply goes to the batch\'s channel');
+});
+
+test('G4: a deferred channel-scoped push spawns the conversation fork it needs', async (t) => {
+  const f = await fixture({ framework: { conversations: { templateAgent: 'agent', bind: { channel: 'always' }, trigger: { channel: 'always' } } } as never, server: { shouldTriggerInference: () => true } }); t.after(f.close); await f.register();
+  await f.send('push/event', f.params('1', 'fallback', { deferred: true, channelId: 'chat', key: 'activity' }));
+  f.alwaysRespond();
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 1);
+  const router = (f.framework as unknown as { conversationRouter: { getBinding(id: string): { agentName: string } | undefined } }).conversationRouter;
+  const fork = router.getBinding('chat')?.agentName;
+  assert(fork, 'a fork was bound');
+  assert(JSON.stringify(f.framework.getAgent(fork!)!.getContextManager().getAllMessages()).includes('document_diff'));
+  assert(!f.context().includes('document_diff'));
+});
+
+test('G6: a replacement finds its prior after the deferred flush stored it', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const internals = f.framework as unknown as { activeTurnTokens: Map<string, number>; flushDeferredWrites(label: string): Promise<void> };
+  internals.activeTurnTokens.set('agent', 100);
+  await f.send('push/event', f.params('1', 'queued_then_stored', { initial: true }));
+  internals.activeTurnTokens.delete('agent');
+  await internals.flushDeferredWrites('test');
+  assert(f.context().includes('queued_then_stored'), 'flushed into context, unread');
+  const r = await f.send('push/event', f.params('2', 'replacement_after_flush'));
+  assert.equal(r.result.coalesce.outcome, 'replaced');
+  assert(!f.context().includes('queued_then_stored') && f.context().includes('replacement_after_flush'));
+  const del = await f.send('push/event', f.params('3', 'notice', { retract: true }));
+  assert.equal(del.result.coalesce.outcome, 'retracted');
+  assert(!f.context().includes('replacement_after_flush'));
+});
+
+test('G9: a receipt is durable before the acceptance is acknowledged', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', f.params('durable', 'x', { initial: true }));
+  const store = (f.framework as unknown as { store: { getStateJson(id: string): unknown } }).store;
+  const recent = store.getStateJson('mcpl/coalescing-recent') as Array<{ key: string; born?: string }>;
+  assert.equal(recent.length, 1);
+  assert(recent[0].key.includes('"durable"'));
+  assert.equal(recent[0].born, 'none');
+});
+
+test('G10: a batch that never began rendering renders after a clean restart', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', f.params('1', 'fallback_text', { deferred: true }));
+  await f.framework.stop(); await f.create();
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 1, 'push/render issued after restart');
+  assert(f.lastRequest().includes('document_diff') && !f.lastRequest().includes('fallback_text'));
+});
+
+test('G11: a push edit without origin identity keeps the channel message identity', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  await f.send('channels/incoming', { messages: [{ ...f.channel('c', 'first_version', { initial: true }), threadId: 'thread' }] });
+  await f.send('push/event', f.params('e', 'second_version', { channelId: 'chat', key: 'message:m' }));
+  const stored = f.framework.getAgent('agent')!.getContextManager().getAllMessages().find((m) => m.metadata?.eventId === 'e');
+  assert.equal(stored?.metadata?.messageId, 'm');
+  assert.equal(stored?.metadata?.threadId, 'thread');
+  assert.deepEqual(stored?.metadata?.author, { id: 'u', name: 'User' });
+});
+
+test('G13: modules see coalesced deliveries', async (t) => {
+  const seen: string[] = [];
+  const spy = { name: 'spy', async start() {}, async stop() {}, async onProcess(e: { type: string }) { seen.push(e.type); return {}; } };
+  const f = await fixture({ framework: { modules: [spy] } as never }); t.after(f.close); await f.register();
+  await f.send('push/event', f.params('1', 'x', { initial: true }));
+  await f.send('channels/incoming', { messages: [f.channel('c', 'y', { initial: true })] });
+  assert.deepEqual(seen.filter((x) => x.startsWith('mcpl:')), ['mcpl:push-event', 'mcpl:channel-incoming']);
+});
+
+test('G15: inference/request is refused while a cancelled render is still outstanding', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  let refused: unknown;
+  f.renderer(async () => {
+    await f.send('push/event', f.params('2', 'notice', { retract: true }));
+    refused = (await f.send('inference/request', { featureSet: 'doc', messages: [] })).error?.code;
+    return { content: [{ type: 'text', text: 'late' }] };
+  });
+  await f.send('push/event', f.params('1', 'fallback', { deferred: true, initial: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(refused, -32600);
+  assert(!f.lastRequest().includes('late') && !f.lastRequest().includes('fallback'));
 });

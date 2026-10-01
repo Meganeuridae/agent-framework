@@ -37,6 +37,7 @@ import type { McplServerRegistry } from './server-registry.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
 import { expandCoreTags } from './tags.js';
+import { validateCoalescedContent } from './push-coalescer.js';
 import { CapabilityGrant } from './capability-grant.js';
 
 // ============================================================================
@@ -913,6 +914,17 @@ export class ChannelRegistry {
 
       // ACCEPTED from here down: semantic processing only for admitted
       // messages. §16.3 core-tag closure, then content conversion.
+      const coalesced = message.coalesce !== undefined && !!this.handleCoalescedIncoming;
+      if (coalesced) {
+        // RFC-006 §13: malformed content on a coalesced item is that item's
+        // failure, not the batch's — check the shape before converting.
+        try {
+          validateCoalescedContent(message.content);
+        } catch (error) {
+          results.push({ messageId: message.messageId, accepted: false, reason: 'coalesce_invalid' });
+          continue;
+        }
+      }
       if (message.tags) message.tags = expandCoreTags(message.tags);
       const convertedContent: ContentBlock[] = message.content.map(convertBlock);
 
@@ -920,16 +932,19 @@ export class ChannelRegistry {
       // deliberately after §14.5 validation: a rejected message from an
       // unregistered channel must not retarget outbound speech (the locus is
       // exactly the authority a self-attested channel would be stealing).
-      this.defaultPublishChannel = message.channelId;
-      this.defaultPublishMessageId = message.messageId;
-      this.defaultPublishThreadId = message.threadId;
-      {
+      // A coalesced item is "accepted" only once the coalescer admits it, so
+      // for those this runs after the hook (below).
+      const markAccepted = () => {
+        this.defaultPublishChannel = message.channelId;
+        this.defaultPublishMessageId = message.messageId;
+        this.defaultPublishThreadId = message.threadId;
         // A server sending channels/incoming is authoritative evidence that
         // the transport is actually open. This repairs transient status only;
         // durable desired state still changes exclusively through lifecycle
         // operations.
         this.channels.get(incomingKey)!.open = true;
-      }
+      };
+      if (!coalesced) markAccepted();
 
       // Determine whether to trigger inference
       let triggerInference = true;
@@ -968,13 +983,15 @@ export class ChannelRegistry {
         triggerInference,
       };
 
-      if (message.coalesce !== undefined && this.handleCoalescedIncoming) {
+      if (coalesced) {
         // RFC-006 §14.3: a coalesced message is admitted like any other and
         // then handed, with the event the ordinary path would have queued, to
         // the coalescer, which replaces, appends or withdraws. Malformed
         // `coalesce` is a per-message failure; siblings are unaffected.
         try {
-          results.push(await this.handleCoalescedIncoming(serverId, message, event));
+          const result = await this.handleCoalescedIncoming!(serverId, message, event);
+          if (result.accepted) markAccepted();
+          results.push(result);
         } catch (error) {
           const err = error as Error & { code?: number };
           results.push({

@@ -18,6 +18,7 @@ import type {
 import type { FeatureSetManager } from './feature-set-manager.js';
 import { McplFeatureSetError } from './feature-set-manager.js';
 import { expandCoreTags } from './tags.js';
+import { validateCoalescedContent } from './push-coalescer.js';
 
 // ============================================================================
 // McplPushEvent (the ProcessEvent shape pushed to the queue)
@@ -232,6 +233,17 @@ export class PushHandler {
     // coalescer's receipts instead (RFC-006 §3.1: a retry within the window
     // gets its original result, which this set could not return).
     const coalesced = params.coalesce !== undefined && !!this.handleCoalesced;
+    if (coalesced) {
+      // RFC-006 §13: malformed content is a -32602, checked before conversion.
+      try {
+        validateCoalescedContent(params.payload?.content);
+      } catch (error) {
+        const err = error as Error & { code?: number; field?: string };
+        if (responder?.respondError) responder.respondError(err.code ?? -32602, err.message, { field: err.field });
+        else responder?.respond({ accepted: false, reason: err.message });
+        return;
+      }
+    }
     if (!coalesced && this.dedup.checkAndAdd(params.eventId)) {
       console.error(`[push-event-rejected] server=${serverId} eventId=${params.eventId} reason=duplicate`);
       responder?.respond({ accepted: false, reason: 'duplicate' });

@@ -535,22 +535,30 @@ export class Agent {
 
   /** Mark everything currently stored as consumed (boot, branch switch). */
   markContextConsumed(): void {
-    // Tolerate partial context-manager doubles (tests build Agents over
+    // Tolerates partial context-manager doubles (tests build Agents over
     // stubs): without a watermark nothing is ever treated as unread.
+    this.consumedWatermark = this.pendingWatermark();
+  }
+
+  /** The watermark a successful compile will establish (taken before, applied after). */
+  private pendingWatermark(): { branch: string; sequence: number } | null {
     const cm = this.contextManager as Partial<ContextManager>;
     try {
-      if (typeof cm.currentBranch !== 'function' || typeof cm.getAllMessages !== 'function') return;
+      if (typeof cm.currentBranch !== 'function' || typeof cm.getAllMessages !== 'function') return null;
       const count = typeof cm.getMessageCount === 'function' ? cm.getMessageCount() : cm.getAllMessages().length;
       const last = count > 0 ? cm.getAllMessages().at(-1) : undefined;
-      this.consumedWatermark = { branch: cm.currentBranch().name, sequence: last?.sequence ?? 0 };
+      return { branch: cm.currentBranch().name, sequence: last?.sequence ?? 0 };
     } catch {
-      this.consumedWatermark = null;
+      return null;
     }
   }
 
   async compileContext(budget?: TokenBudget): Promise<CompileResult> {
-    this.markContextConsumed();
+    // RFC-006 §3.3: consumption is determined at assembly — a compile that
+    // fails assembled nothing, so the watermark moves only on success.
+    const watermark = this.pendingWatermark();
     const result = await this.contextManager.compile(this.resolveBudget(budget));
+    if (watermark) this.consumedWatermark = watermark;
     if (!budget) this.settleRuntimeSettingsTransition();
     return result;
   }
@@ -565,10 +573,11 @@ export class Agent {
     injections?: ContextInjection[],
     opts?: { kvUnifiedImmutablePrefixHash?: string },
   ): Promise<CompileResult> {
-    this.markContextConsumed();
+    const watermark = this.pendingWatermark();
     const result = await this.contextManager.compile(
       this.resolveBudget(budget), injections, opts as never,
     );
+    if (watermark) this.consumedWatermark = watermark;
     if (!budget) this.settleRuntimeSettingsTransition();
     return result;
   }

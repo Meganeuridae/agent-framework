@@ -48,6 +48,11 @@ export interface CoalescingScope { kind: 'featureSet' | 'channel'; id: string }
 /** One admitted occurrence, normalized from either lane. */
 export interface CoalescedOccurrence<E = unknown> {
   serverId: string;
+  /** Host-owned binding identity (§3.2): stable across reconnects to the same
+   *  configured peer, different when the id is reassigned to another one. */
+  binding: string;
+  /** Declaring feature set (push lane), echoed in push/render. */
+  featureSet?: string;
   scope: CoalescingScope;
   key: string;
   eventId: string;
@@ -63,6 +68,9 @@ export interface CoalescedOccurrence<E = unknown> {
   identity?: { messageId?: string; author?: { id: string; name: string }; threadId?: string };
   /** The event the ordinary path would have queued — the host delivers it. */
   event: E;
+  /** Set by the coalescer: deliver into this agent only (§3.2 audience may
+   *  narrow, never widen — a replacement or notice follows the prior delivery). */
+  deliverTo?: string;
 }
 
 export interface DeferredNotice { eventId: string; timestamp: string; data?: unknown }
@@ -99,6 +107,8 @@ interface SubjectState<E> {
   rendering?: Rendering<E>;
   consumedEventId?: string;
   identity?: CoalescedOccurrence['identity'];
+  /** Agent that received the last delivery; replacements and notices follow it. */
+  audienceAgent?: string;
   touchedAt: number;
 }
 
@@ -111,30 +121,43 @@ export interface CoalescingSnapshot {
     consumedEventId?: string;
     identity?: CoalescedOccurrence['identity'];
     occupant?: { eventId: string; placement: CoalescingPlacement };
-    batch?: { latest: CoalescedOccurrence<unknown>; notices: DeferredNotice[]; dropped: number };
+    audienceAgent?: string;
+    batch?: { latest: CoalescedOccurrence<unknown>; notices: DeferredNotice[]; dropped: number; rendering?: boolean };
   }>;
+}
+/** One receipt, written synchronously at acceptance (bridges the snapshot throttle). */
+export interface CoalescingReceiptRecord {
+  key: string;
+  result: PushEventResult;
+  at: number;
+  subject: string;
+  /** History the subject was created with, for a subject first seen by this receipt. */
+  born?: SubjectState<unknown>['history'];
 }
 
 export interface CoalescerHost<E> {
   /** True iff the placement still exists and no model request has included it. */
   isUnread(placement: CoalescingPlacement): boolean;
-  remove(placement: CoalescingPlacement): void;
+  /** False when the unread occurrence could not be removed (it may still be read). */
+  remove(placement: CoalescingPlacement): boolean;
   /** Ordinary delivery of the event; undefined when routing delivered nowhere.
    *  A replacement is delivered as a fresh message after the unread prior was
    *  removed: it lands where a fresh event lands (§4.1 allows either place). */
   deliver(occurrence: CoalescedOccurrence<E>, materialized?: McplContentBlock[], assemblingFor?: string): Promise<CoalescingPlacement | undefined>;
   /** Queue a wake for a batch that has no model-visible content yet. */
-  wakeForBatch(occurrence: CoalescedOccurrence<E>): void;
+  wakeForBatch(occurrence: CoalescedOccurrence<E>): Promise<void>;
   /** Withdraw unstarted wakes whose sole cause is this subject. */
   cancelWake(subject: string): void;
   /** The batch's audience still holds the authority it was admitted under. */
   authorized(occurrence: CoalescedOccurrence<E>): boolean;
-  /** Agents that read this occurrence's delivery target. */
-  audience(occurrence: CoalescedOccurrence<E>): string[];
+  /** Agents that read this occurrence's delivery target (may spawn a fork). */
+  audience(occurrence: CoalescedOccurrence<E>): Promise<string[]>;
   render(occurrence: CoalescedOccurrence<E>, params: PushRenderParams): Promise<PushRenderResult>;
   audit(record: Record<string, unknown>): void;
   /** Persist (throttled by the host); the thunk builds the snapshot lazily. */
   save(snapshot: () => CoalescingSnapshot): void;
+  /** Persist one receipt now, before the acceptance is acknowledged. */
+  recordReceipt?(record: CoalescingReceiptRecord): void;
   now?(): number;
 }
 
@@ -146,8 +169,17 @@ export interface CoalescerOptions {
   maxDataBytes?: number;
 }
 
-export function coalescingSubjectKey(serverId: string, scope: CoalescingScope, key: string): string {
-  return JSON.stringify([serverId, scope.kind, scope.id, key]);
+export function coalescingSubjectKey(serverId: string, binding: string, scope: CoalescingScope, key: string): string {
+  return JSON.stringify([serverId, binding, scope.kind, scope.id, key]);
+}
+export function coalescingReceiptKey(serverId: string, binding: string, eventId: string): string {
+  return JSON.stringify([serverId, binding, eventId]);
+}
+/** Merge identity fields, never letting an absent field erase a known one (§3.1). */
+function mergeIdentity(prior: CoalescedOccurrence['identity'], next: CoalescedOccurrence['identity']): CoalescedOccurrence['identity'] {
+  const out = { ...prior };
+  for (const [k, v] of Object.entries(next ?? {})) if (v !== undefined) (out as Record<string, unknown>)[k] = v;
+  return out;
 }
 
 /** Validate wire content before it is stored, rendered or converted. */
@@ -198,6 +230,8 @@ export class PushCoalescer<E = unknown> {
   private readonly retryWindowMs: number;
   private readonly maxSubjects: number;
   private readonly maxNotices: number;
+  /** Outstanding push/render RPCs per server, including cancelled ones (§10.7). */
+  private readonly rendersInFlight = new Map<string, number>();
   private suspended = false;
 
   constructor(private readonly host: CoalescerHost<E>, private readonly options: CoalescerOptions = {}) {
@@ -223,18 +257,17 @@ export class PushCoalescer<E = unknown> {
     return n;
   }
 
-  /** §10.7: a server handling push/render must not issue inference/request. */
+  /** §10.7: a server handling push/render must not issue inference/request —
+   *  including a render whose batch was cancelled while the RPC is outstanding. */
   isRendering(serverId: string): boolean {
-    for (const s of this.subjects.values()) {
-      if (s.rendering && !s.rendering.cancelled && s.rendering.batch.latest.serverId === serverId) return true;
-    }
-    return false;
+    return (this.rendersInFlight.get(serverId) ?? 0) > 0;
   }
 
-  receipt(serverId: string, eventId: string): PushEventResult | undefined {
-    const entry = this.receipts.get(JSON.stringify([serverId, eventId]));
+  receipt(serverId: string, binding: string, eventId: string): PushEventResult | undefined {
+    const key = coalescingReceiptKey(serverId, binding, eventId);
+    const entry = this.receipts.get(key);
     if (!entry) return undefined;
-    if (this.now() - entry.at > this.retryWindowMs) { this.receipts.delete(JSON.stringify([serverId, eventId])); return undefined; }
+    if (this.now() - entry.at > this.retryWindowMs) { this.receipts.delete(key); return undefined; }
     return structuredClone(entry.result);
   }
 
@@ -250,9 +283,10 @@ export class PushCoalescer<E = unknown> {
    */
   async accept(occurrence: CoalescedOccurrence<E>): Promise<PushEventResult> {
     if (this.suspended) throw new CoalesceError('serverId', 'host is stopping', -32000);
-    const duplicate = this.receipt(occurrence.serverId, occurrence.eventId);
+    const duplicate = this.receipt(occurrence.serverId, occurrence.binding, occurrence.eventId);
     if (duplicate) return duplicate;
-    const subject = coalescingSubjectKey(occurrence.serverId, occurrence.scope, occurrence.key);
+    const subject = coalescingSubjectKey(occurrence.serverId, occurrence.binding, occurrence.scope, occurrence.key);
+    const born = this.subjects.has(subject) ? undefined : (occurrence.initial && !occurrence.retract ? 'none' as const : 'unknown' as const);
     const state = this.subjectFor(subject, occurrence);
     const occupantUnread = this.refreshOccupant(state);
     const priorEventId = state.occupant?.eventId ?? state.batch?.latest.eventId ?? state.rendering?.batch.latest.eventId ?? state.consumedEventId;
@@ -262,16 +296,19 @@ export class PushCoalescer<E = unknown> {
     if (occurrence.retract) {
       outcome = await this.retract(subject, state, occurrence, occupantUnread);
     } else if (occurrence.deferred) {
-      outcome = this.acceptDeferred(subject, state, occurrence, occupantUnread);
+      outcome = await this.acceptDeferred(subject, state, occurrence, occupantUnread);
     } else {
       outcome = await this.acceptPlain(subject, state, occurrence, occupantUnread);
     }
     if (occurrence.scope.kind === 'channel' && occurrence.identity && !occurrence.retract) {
-      state.identity = { ...state.identity, ...occurrence.identity };
+      state.identity = mergeIdentity(state.identity, occurrence.identity);
     }
     state.touchedAt = this.now();
     const result: PushEventResult = { accepted: true, coalesce: { outcome, ...(priorEventId ? { priorEventId } : {}) } };
-    this.receipts.set(JSON.stringify([occurrence.serverId, occurrence.eventId]), { result: structuredClone(result), at: this.now() });
+    const receiptKey = coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId);
+    const entry = { result: structuredClone(result), at: this.now() };
+    this.receipts.set(receiptKey, entry);
+    this.host.recordReceipt?.({ key: receiptKey, ...structuredClone(entry), subject, ...(born ? { born } : {}) });
     this.prune();
     this.persist();
     return structuredClone(result);
@@ -313,7 +350,11 @@ export class PushCoalescer<E = unknown> {
   private async retract(subject: string, state: SubjectState<E>, occurrence: CoalescedOccurrence<E>, occupantUnread: boolean): Promise<CoalesceOutcome> {
     if (occupantUnread && state.occupant) {
       this.host.audit({ kind: 'removed', subject, eventId: state.occupant.eventId });
-      this.host.remove(state.occupant.placement);
+      if (!this.host.remove(state.occupant.placement)) {
+        // Still in context and possibly about to be read: say so, append the notice.
+        this.host.audit({ kind: 'remove-failed', subject, eventId: state.occupant.eventId });
+        state.history = 'unknown';
+      }
     }
     state.occupant = undefined;
     this.dropBatches(subject, state);
@@ -322,10 +363,12 @@ export class PushCoalescer<E = unknown> {
     if (state.history === 'none') return 'retracted';
     if (!occurrence.content.length) return 'consumed';
     // The notice is an ordinary occurrence: it rides the normal delivery path
-    // (tags → gate policy → wake) and is consumed like any message.
-    const placement = await this.host.deliver(occurrence);
+    // (tags → gate policy → wake) and is consumed like any message — in the
+    // context that read a version, never a new one (§3.2).
+    const placement = await this.host.deliver({ ...occurrence, deliverTo: state.audienceAgent });
     if (placement) {
       state.occupant = { eventId: occurrence.eventId, placement };
+      state.audienceAgent = placement.agent;
     }
     return 'noted';
   }
@@ -335,28 +378,37 @@ export class PushCoalescer<E = unknown> {
     if (occupantUnread && state.occupant) {
       const prior = state.occupant;
       this.host.audit({ kind: 'displaced', subject, eventId: prior.eventId });
-      this.host.remove(prior.placement);
-      this.host.cancelWake(subject);
-      const placement = await this.host.deliver(occurrence);
-      state.occupant = placement ? { eventId: occurrence.eventId, placement } : undefined;
-      return 'replaced';
+      if (this.host.remove(prior.placement)) {
+        this.host.cancelWake(subject);
+        // The replacement follows the prior delivery's audience (§3.2).
+        const placement = await this.host.deliver({ ...occurrence, deliverTo: prior.placement.agent });
+        state.occupant = placement ? { eventId: occurrence.eventId, placement } : undefined;
+        if (placement) state.audienceAgent = placement.agent;
+        return 'replaced';
+      }
+      // Could not remove: the prior may still be read. Append, as for consumed.
+      this.host.audit({ kind: 'remove-failed', subject, eventId: prior.eventId });
+      state.history = 'unknown';
+      state.consumedEventId = prior.eventId;
+      state.occupant = undefined;
     }
     if (hadBatch) this.host.cancelWake(subject);
     const placement = await this.host.deliver(occurrence);
     state.occupant = placement ? { eventId: occurrence.eventId, placement } : undefined;
+    if (placement) state.audienceAgent = placement.agent;
     if (hadBatch) return 'replaced';
     return state.consumedEventId || state.history !== 'none' ? 'appended' : 'first';
   }
 
-  private acceptDeferred(subject: string, state: SubjectState<E>, occurrence: CoalescedOccurrence<E>, occupantUnread: boolean): CoalesceOutcome {
+  private async acceptDeferred(subject: string, state: SubjectState<E>, occurrence: CoalescedOccurrence<E>, occupantUnread: boolean): Promise<CoalesceOutcome> {
     let outcome: CoalesceOutcome = 'first';
     if (occupantUnread && state.occupant) {
       // §5.1: a notice displaces an unread plain occurrence and opens a batch.
       this.host.audit({ kind: 'displaced', subject, eventId: state.occupant.eventId });
-      this.host.remove(state.occupant.placement);
+      if (this.host.remove(state.occupant.placement)) outcome = 'replaced';
+      else { this.host.audit({ kind: 'remove-failed', subject, eventId: state.occupant.eventId }); state.history = 'unknown'; }
       this.host.cancelWake(subject);
       state.occupant = undefined;
-      outcome = 'replaced';
     }
     const notice: DeferredNotice = { eventId: occurrence.eventId, timestamp: occurrence.timestamp, ...(occurrence.data !== undefined ? { data: structuredClone(occurrence.data) } : {}) };
     if (state.batch) {
@@ -368,7 +420,7 @@ export class PushCoalescer<E = unknown> {
       // Rule 1: a notice during a render opens a NEW batch ("first").
       state.batch = { latest: occurrence, notices: [notice], dropped: 0 };
     }
-    this.host.wakeForBatch(occurrence);
+    await this.host.wakeForBatch(occurrence);
     return outcome;
   }
 
@@ -388,11 +440,11 @@ export class PushCoalescer<E = unknown> {
     for (const [subject, state] of this.subjects) {
       if (state.rendering) {
         // Another assembly froze this batch; share its outcome (vector 25).
-        if (this.host.audience(state.rendering.batch.latest).includes(agentName)) work.push(state.rendering.done);
+        if ((await this.host.audience(state.rendering.batch.latest)).includes(agentName)) work.push(state.rendering.done);
         continue;
       }
       const batch = state.batch;
-      if (!batch || !this.host.audience(batch.latest).includes(agentName)) continue;
+      if (!batch || !(await this.host.audience(batch.latest)).includes(agentName)) continue;
       state.batch = undefined;
       this.host.cancelWake(subject);
       if (!this.host.authorized(batch.latest)) {
@@ -418,11 +470,12 @@ export class PushCoalescer<E = unknown> {
     let source: 'render' | 'fallback' = 'fallback';
     if (!batch.noRender) {
       const params: PushRenderParams = {
-        featureSet: (occurrence.event as { featureSet?: string } | undefined)?.featureSet ?? (occurrence.scope.kind === 'featureSet' ? occurrence.scope.id : ''),
+        featureSet: occurrence.featureSet ?? (occurrence.scope.kind === 'featureSet' ? occurrence.scope.id : ''),
         ...(occurrence.scope.kind === 'channel' ? { channelId: occurrence.scope.id } : {}),
         key: occurrence.key, eventId: occurrence.eventId,
         notices: structuredClone(batch.notices), dropped: batch.dropped,
       };
+      this.rendersInFlight.set(occurrence.serverId, (this.rendersInFlight.get(occurrence.serverId) ?? 0) + 1);
       try {
         const result = await this.host.render(occurrence, params);
         if (rendering.cancelled) { this.host.audit({ kind: 'late-render', subject, eventId: occurrence.eventId, discarded: true }); return; }
@@ -433,6 +486,9 @@ export class PushCoalescer<E = unknown> {
       } catch (error) {
         if (rendering.cancelled) return;
         this.host.audit({ kind: 'render-failed', subject, eventId: occurrence.eventId, error: String(error) });
+      } finally {
+        const left = (this.rendersInFlight.get(occurrence.serverId) ?? 1) - 1;
+        if (left > 0) this.rendersInFlight.set(occurrence.serverId, left); else this.rendersInFlight.delete(occurrence.serverId);
       }
     }
     if (rendering.cancelled) return;
@@ -440,11 +496,19 @@ export class PushCoalescer<E = unknown> {
     if (!this.host.authorized(occurrence)) { this.host.audit({ kind: 'revoked', subject, eventId: occurrence.eventId }); return; }
     this.host.audit({ kind: 'rendered', subject, eventId: occurrence.eventId, source, empty: content.length === 0 });
     if (!content.length) return; // §5.2: nothing happened
+    const placement = await this.host.deliver({ ...occurrence, timestamp, content }, content, assemblingFor);
+    if (placement?.deferredId) {
+      // Landed in another agent's deferred queue (its turn is alive): still
+      // unread there, so it stays replaceable and withdrawable.
+      state.occupant = { eventId: occurrence.eventId, placement };
+      state.audienceAgent = placement.agent;
+      return;
+    }
     // The materialized occurrence is consumed by the request being assembled.
-    await this.host.deliver({ ...occurrence, timestamp, content }, content, assemblingFor);
     state.history = 'some';
     state.consumedEventId = occurrence.eventId;
     state.occupant = undefined;
+    if (placement) state.audienceAgent = placement.agent;
   }
 
   // ---------------------------------------------------------------------------
@@ -464,14 +528,26 @@ export class PushCoalescer<E = unknown> {
         history: s.occupant ? 'some' : s.history,
         consumedEventId: s.occupant?.eventId ?? s.consumedEventId,
         identity: s.identity,
+        audienceAgent: s.audienceAgent ?? s.occupant?.placement.agent,
         touchedAt: now,
       };
       if (s.batch) {
-        // An interrupted render is not replayed (§3.2): the batch keeps its
-        // fallback and materializes that at the next assembly.
-        state.batch = { latest: s.batch.latest as CoalescedOccurrence<E>, notices: s.batch.notices, dropped: s.batch.dropped, noRender: true };
+        // An interrupted render is not replayed (§3.2): a batch that was
+        // RENDERING keeps its fallback; a batch that was only pending renders
+        // normally at the next assembly.
+        state.batch = { latest: s.batch.latest as CoalescedOccurrence<E>, notices: s.batch.notices, dropped: s.batch.dropped, ...(s.batch.rendering ? { noRender: true } : {}) };
       }
       this.subjects.set(s.subject, state);
+    }
+  }
+
+  /** Apply receipts written since the last snapshot (crash-window bridge). */
+  restoreReceipts(records: CoalescingReceiptRecord[]): void {
+    const now = this.now();
+    for (const r of records) {
+      if (now - r.at > this.retryWindowMs) continue;
+      this.receipts.set(r.key, { result: r.result, at: r.at });
+      if (r.born && !this.subjects.has(r.subject)) this.subjects.set(r.subject, { history: r.born, touchedAt: now });
     }
   }
 
@@ -481,9 +557,10 @@ export class PushCoalescer<E = unknown> {
       receipts: [...this.receipts],
       subjects: [...this.subjects].map(([subject, s]) => ({
         subject, history: s.history, consumedEventId: s.consumedEventId, identity: s.identity,
+        ...(s.audienceAgent ? { audienceAgent: s.audienceAgent } : {}),
         ...(s.occupant ? { occupant: s.occupant } : {}),
-        ...(s.batch ? { batch: { latest: s.batch.latest as CoalescedOccurrence<unknown>, notices: s.batch.notices, dropped: s.batch.dropped } }
-          : s.rendering ? { batch: { latest: s.rendering.batch.latest as CoalescedOccurrence<unknown>, notices: s.rendering.batch.notices, dropped: s.rendering.batch.dropped } }
+        ...(s.batch ? { batch: { latest: s.batch.latest as CoalescedOccurrence<unknown>, notices: s.batch.notices, dropped: s.batch.dropped, ...(s.batch.noRender ? { rendering: true } : {}) } }
+          : s.rendering ? { batch: { latest: s.rendering.batch.latest as CoalescedOccurrence<unknown>, notices: s.rendering.batch.notices, dropped: s.rendering.batch.dropped, rendering: true } }
           : {}),
       })),
     };
