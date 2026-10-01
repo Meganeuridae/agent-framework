@@ -67,6 +67,8 @@ import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
 import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
+import { ToolLifecycleEmitter, parseToolObserveParams } from './mcpl/tool-lifecycle.js';
+import { BUILTIN_TOOL_CLASSES, normalizeClassTable, parseDeclaredClasses, resolveToolClass, type ToolClass } from './mcpl/tool-classes.js';
 import { PushHandler, type McplPushEvent } from './mcpl/push-handler.js';
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
@@ -1212,6 +1214,17 @@ export class AgentFramework {
   private mcplServerRegistry: McplServerRegistry | null = null;
   private featureSetManager: FeatureSetManager | null = null;
   private hookOrchestrator: HookOrchestrator | null = null;
+  /** MCPL RFC-007: `tools/lifecycle` to observing servers. Created with the
+   *  MCPL subsystem; inert (no tracking) while no connection holds
+   *  `toolLifecycle.observe`. */
+  private toolLifecycleEmitter: ToolLifecycleEmitter | null = null;
+  /** MCPL RFC-008 class sources, normalized: operator overrides, then host
+   *  knowledge (embedding host's table ahead of the built-in one). */
+  private toolClassOverrides: Array<[string, ToolClass[]]> = [];
+  private hostToolClasses: Array<[string, ToolClass[]]> = normalizeClassTable(
+    BUILTIN_TOOL_CLASSES as Record<string, readonly string[]>,
+    'BUILTIN_TOOL_CLASSES',
+  );
   private pushHandler: PushHandler | null = null;
   private inferenceRouter: InferenceRouter | null = null;
   private channelRegistry: ChannelRegistry | null = null;
@@ -1265,6 +1278,8 @@ export class AgentFramework {
   private mcplTools: import('./types/index.js').ToolDefinition[] = [];
   /** Namespaced tool name → stateful feature-set attribution from tools/list. */
   private mcplToolFeatureSets: Map<string, string> = new Map();
+  /** Namespaced tool name → the server's RFC-008 `_meta["mcpl/class"]`. */
+  private mcplToolClasses: Map<string, ToolClass[]> = new Map();
   private mcplToolRefreshInFlight = false;
   private mcplToolRefreshPending = false;
   /** Maps tool prefix → serverId for dispatch routing. */
@@ -1587,6 +1602,12 @@ export class AgentFramework {
     // Client-side programmatic tool calling (code_execution). Config is only
     // retained when enabled — everything downstream gates on the field.
     framework.codeExecutionConfig = config.codeExecution?.enabled ? config.codeExecution : null;
+
+    framework.toolClassOverrides = normalizeClassTable(config.toolClassOverrides, 'toolClassOverrides');
+    framework.hostToolClasses = [
+      ...normalizeClassTable(config.hostToolClasses, 'hostToolClasses'),
+      ...normalizeClassTable(BUILTIN_TOOL_CLASSES as Record<string, readonly string[]>, 'BUILTIN_TOOL_CLASSES'),
+    ];
 
     if (config.toolResultInlineMaxChars !== undefined) {
       const cap = config.toolResultInlineMaxChars;
@@ -6299,6 +6320,10 @@ export class AgentFramework {
         return;
       }
 
+      // RFC-007: the call's terminal (completed / failed) — the result
+      // itself is never sent, only whether it was an error.
+      this.toolLifecycleEmitter?.onResult(event.agentName, event.callId, event.result);
+
       const agent = this.agents.get(event.agentName);
       if (agent) {
         this.touchEphemeralRun(event.agentName, true);
@@ -8566,6 +8591,9 @@ export class AgentFramework {
     // id makes the discarded attempt's chunk buffer orphaned (never
     // finalized) instead of being appended to — see the 'retrying' case.
     let outgoingInferenceId = newOutgoingInferenceId();
+    // RFC-007: every inference id THIS stream mints, so the stream's end
+    // aborts only its own open tool calls — never a successor's.
+    const lifecycleInferenceIds = new Set<string>([outgoingInferenceId]);
     let outgoingIndex = 0;
 
     // §10.5 inference/lifecycle: `started` now, exactly one terminal in the
@@ -8663,6 +8691,7 @@ export class AgentFramework {
                 ' — discarding the refused attempt',
             );
             outgoingInferenceId = newOutgoingInferenceId();
+            lifecycleInferenceIds.add(outgoingInferenceId);
             outgoingIndex = 0;
             proseStream?.reset();
             this.emitTrace({
@@ -8761,7 +8790,14 @@ export class AgentFramework {
             agent.enterWaitingForTools(event.calls, stream);
 
             for (const call of event.calls) {
+              // RFC-007: register at the one dispatch point for model-issued
+              // calls, keyed by (agent, call id) with this inference's id;
+              // `started` goes out once dispatch returns. Refusal sites inside
+              // dispatch run synchronously and call refuse() first, so a call
+              // the host refuses produces no events.
+              this.toolLifecycleEmitter?.register(agent.name, outgoingInferenceId, call);
               this.dispatchToolCall(agent.name, call);
+              this.toolLifecycleEmitter?.open(agent.name, call.id);
             }
 
             // Speak-while-acting: route THIS round's prose to the locus NOW
@@ -9705,6 +9741,13 @@ export class AgentFramework {
       // completed; catch → failed; framework-cancel → aborted). A host
       // crash emits nothing — that is the documented best-effort limit, and
       // why consumers keep their safety timeout.
+      //
+      // RFC-007 §7.3: a tool call still open when its turn's stream ends was
+      // cancelled before a result — its terminal is `aborted`. (A normal turn
+      // has none: the stream waits for every result before continuing.)
+      // Scoped to this stream's own inference ids: a budget-restart successor
+      // may already be running for the same agent.
+      this.toolLifecycleEmitter?.abortOpen(agent.name, lifecycleInferenceIds);
       this.hookOrchestrator?.emitLifecycle({
         inferenceId: outgoingInferenceId,
         conversationId: agent.name,
@@ -10061,6 +10104,7 @@ export class AgentFramework {
     const startTime = Date.now();
     this.runCodeExecution(agentName, call)
       .catch((error): ToolResult => {
+        this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
         // runCodeExecution is designed not to reject; this is the last-resort
         // guard so a bug here can never strand the agent in waiting_for_tools.
         const err = error instanceof Error ? error : new Error(String(error));
@@ -10926,6 +10970,41 @@ export class AgentFramework {
     this.store.appendToStateJson(PROCESS_LOG_ID, entryToStore);
   }
 
+  /** Forget one server's RFC-008 class declarations (see the close handler). */
+  private dropMcplToolClasses(serverId: string): void {
+    // Tolerate partially-constructed frameworks (tests build them with
+    // Object.create): nothing cached means nothing to forget.
+    if (!this.mcplToolClasses?.size) return;
+    const prefix = this.mcplServerConfigs?.get(serverId)?.toolPrefix ?? `mcpl--${serverId}`;
+    for (const name of [...this.mcplToolClasses.keys()]) {
+      if (name.startsWith(`${prefix}--`)) this.mcplToolClasses.delete(name);
+    }
+  }
+
+  /**
+   * RFC-007/RFC-008: what tools/lifecycle says about a model-facing tool —
+   * its effective class, and for MCPL tools the providing connection and
+   * the server's own tool name. Host knowledge (built-in table, embedding
+   * host's table) applies only to tools the host implements; an MCPL tool's
+   * class comes from an operator override or its server's declaration.
+   */
+  private describeToolForLifecycle(tool: string): { class: ToolClass[]; serverId?: string; serverTool?: string } {
+    const mcpl = this.resolveMcplTool(tool);
+    if (mcpl) {
+      const [serverId, prefix] = mcpl;
+      const { classes } = resolveToolClass(tool, this.mcplToolClasses.get(tool), {
+        overrides: this.toolClassOverrides,
+        host: [],
+      });
+      return { class: classes, serverId, serverTool: tool.slice(prefix.length + 2) };
+    }
+    const { classes } = resolveToolClass(tool, undefined, {
+      overrides: this.toolClassOverrides,
+      host: this.hostToolClasses,
+    });
+    return { class: classes };
+  }
+
   /**
    * Find the MCPL server for a tool call by checking against the prefix map.
    * Returns [serverId, prefix] if found, null otherwise.
@@ -11130,6 +11209,8 @@ export class AgentFramework {
       })
       .catch((error) => {
         const err = error instanceof Error ? error : new Error(String(error));
+        // RFC-007: the module threw — the host could not obtain a result.
+        this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
         this.emitTrace({
           type: 'tool:failed',
           module: moduleName,
@@ -11784,6 +11865,11 @@ export class AgentFramework {
     this.mcplServerRegistry = new McplServerRegistry();
     this.featureSetManager = new FeatureSetManager();
     this.hookOrchestrator = new HookOrchestrator(this.mcplServerRegistry, this.featureSetManager);
+    this.toolLifecycleEmitter = new ToolLifecycleEmitter({
+      observers: () => this.mcplServerRegistry?.getAllServers() ?? [],
+      configFor: (serverId) => this.mcplServerConfigs.get(serverId)?.toolLifecycle,
+      describe: (tool) => this.describeToolForLifecycle(tool),
+    });
 
     // Build prefix map and store configs for tool routing
     for (const config of serverConfigs) {
@@ -11911,6 +11997,9 @@ export class AgentFramework {
         beforeInference: true,
       },
       inferenceLifecycle: true,
+      // RFC-007: tools/lifecycle (metadata, and requested argument fields
+      // under their own grant) plus the tools/observe filter.
+      toolLifecycle: { observe: true, inputs: true },
       // modelInfo is NOT advertised: §12.2's result requires all four of
       // {id, vendor, contextWindow, capabilities} and the host has no
       // truthful source for contextWindow/capabilities (grep: none exists).
@@ -12793,6 +12882,13 @@ export class AgentFramework {
     /** Host-owned authority; deliberately separate from the portable grant. */
     allowHostCommands: boolean;
     /**
+     * RFC-007 §10: the server's current tools/observe filter — its own
+     * statement of which calls and argument fields it uses, shown next to
+     * the grant so an operator can narrow toolLifecycle.inputs to match. It
+     * confers nothing. Null = no filter (granted calls, metadata only).
+     */
+    toolObserveFilter: import('./mcpl/tool-lifecycle.js').ToolObserveRule[] | null;
+    /**
      * Per-transport §17 facts about the last manifest this host fetched and
      * acted on. The revision is server-authored and equality-only; these are
      * not the server's manifestChanged announcements.
@@ -12810,6 +12906,7 @@ export class AgentFramework {
       toolPrefix: string; toolCount: number; policyEstablished: boolean;
       effectiveGrant: string[]; maskedCapabilities: string[];
       deniedCapabilities: string[]; allowHostCommands: boolean;
+      toolObserveFilter: import('./mcpl/tool-lifecycle.js').ToolObserveRule[] | null;
       manifestState: {
         lastValidatedRevision: string | null;
         lastFetchedAt: number | null;
@@ -12832,6 +12929,7 @@ export class AgentFramework {
         maskedCapabilities: [...(connection?.droppedCapabilities ?? [])].sort(),
         deniedCapabilities: [...(connection?.grant.deniedPaths ?? [])].sort(),
         allowHostCommands: config.allowHostCommands === true,
+        toolObserveFilter: connection?.toolObserveFilter ?? null,
         manifestState: connection
           ? { ...connection.manifestState }
           : { lastValidatedRevision: null, lastFetchedAt: null, lastNegotiatedAt: null },
@@ -12926,6 +13024,23 @@ export class AgentFramework {
       responder?.respond({
         channels: this.channelRegistry?.descriptorsForServer(connection.id) ?? [],
       });
+    });
+
+    // RFC-007 §6: the server's filter over tools/lifecycle. Admission already
+    // required toolLifecycle.observe (-32002 otherwise). Validation failures
+    // leave the previous filter in force (§6.6).
+    connection.on('tools-observe', (
+      params: unknown,
+      responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void },
+    ) => {
+      const parsed = parseToolObserveParams(params);
+      if (!parsed.ok) {
+        if (responder?.respondError) responder.respondError(-32602, parsed.message, parsed.data);
+        else console.error(`[mcpl] ${connection.id}: tools/observe rejected — ${parsed.message}`);
+        return;
+      }
+      connection.toolObserveFilter = parsed.rules;
+      responder?.respond({});
     });
 
     connection.on('model-info', (
@@ -13114,6 +13229,10 @@ export class AgentFramework {
     // disconnectMcplServer, which deletes the trees explicitly.
     connection.on('close', (code?: number | null, signal?: string | null) => {
       this.featureSetManager?.removeServer(connection.id);
+      // RFC-008: a closed provider's class hints are stale — on reconnect it
+      // may class its tools differently. Until the next tools/list its tools
+      // are unclassed, the restrictive answer (RFC-007 §4.3).
+      this.dropMcplToolClasses(connection.id);
       this.emitTrace({
         type: 'mcpl:server-closed',
         serverId: connection.id,
@@ -13134,6 +13253,7 @@ export class AgentFramework {
 
     const tools: import('./types/index.js').ToolDefinition[] = [];
     const toolFeatureSets = new Map<string, string>();
+    const toolClasses = new Map<string, ToolClass[]>();
 
     for (const server of this.mcplServerRegistry.getAllServers()) {
       const config = this.mcplServerConfigs.get(server.id);
@@ -13145,8 +13265,12 @@ export class AgentFramework {
           const namespacedName = `${prefix}--${tool.name}`;
           const attributedTool = tool as typeof tool & {
             featureSet?: unknown;
-            _meta?: { featureSet?: unknown };
+            _meta?: { featureSet?: unknown; [key: string]: unknown };
           };
+          // RFC-008: the server's class hint for this tool. Never shown to
+          // the model (the definition below is unchanged by it).
+          const declaredClasses = parseDeclaredClasses(attributedTool._meta, namespacedName);
+          if (declaredClasses) toolClasses.set(namespacedName, declaredClasses);
           const featureSet = typeof attributedTool.featureSet === 'string'
             ? attributedTool.featureSet
             : typeof attributedTool._meta?.featureSet === 'string'
@@ -13170,6 +13294,7 @@ export class AgentFramework {
 
     this.mcplTools = tools;
     this.mcplToolFeatureSets = toolFeatureSets;
+    this.mcplToolClasses = toolClasses;
   }
 
   /**
@@ -13235,6 +13360,8 @@ export class AgentFramework {
     const server = this.mcplServerRegistry!.getServer(serverId);
 
     if (!server) {
+      // RFC-007: refused before executing — no lifecycle events.
+      this.toolLifecycleEmitter?.refuse(agentName, call.id);
       this.pushEvent({
         type: 'tool-result',
         callId: call.id,
@@ -13247,6 +13374,7 @@ export class AgentFramework {
 
     const config = this.mcplServerConfigs.get(serverId);
     if (!isToolAllowed(toolName, config)) {
+      this.toolLifecycleEmitter?.refuse(agentName, call.id);
       this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: 'denied by tool policy' });
       this.pushEvent({
         type: 'tool-result',
@@ -13423,6 +13551,8 @@ export class AgentFramework {
       .catch((error) => {
         const err = error instanceof Error ? error : new Error(String(error));
         this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: err.message, stack: err.stack });
+        // RFC-007: transport error, closed connection or timeout — no result.
+        this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
 
         this.pushEvent({
           type: 'tool-result',
@@ -13449,6 +13579,8 @@ export class AgentFramework {
     const home = this.conversationAgentHomes.get(agentName);
     if (home) {
       const reject = (error: string): void => {
+        // RFC-007: the guard refuses before the tool runs — no lifecycle events.
+        this.toolLifecycleEmitter?.refuse(agentName, call.id);
         this.emitTrace({
           type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id,
           error: `conversation agent ${agentName}: ${error}`,
@@ -13532,6 +13664,7 @@ export class AgentFramework {
       .catch((error) => {
         const err = error instanceof Error ? error : new Error(String(error));
         this.emitTrace({ type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id, error: err.message });
+        this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
@@ -14614,6 +14747,7 @@ export class AgentFramework {
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
       this.emitTrace({ type: 'tool:failed', module: 'gate', tool: call.name, callId: call.id, error: err.message });
+      this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
       result = { success: false, error: err.message, isError: true };
     }
     this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'gate', result });
@@ -14638,6 +14772,7 @@ export class AgentFramework {
       .catch((error) => {
         const err = error instanceof Error ? error : new Error(String(error));
         this.emitTrace({ type: 'tool:failed', module: 'gate', tool: call.name, callId: call.id, error: err.message });
+        this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
