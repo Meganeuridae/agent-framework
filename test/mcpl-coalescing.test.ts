@@ -989,3 +989,26 @@ test('R17: a persistent storage outage backs off (1×, 2×, 4× …) and the ser
   assert.equal(coalescer.pendingBatches(), 0);
   assert.equal(coalescer.recovery.size, 0, 'the failure series is forgotten on success');
 });
+
+// ---------------------------------------------------------------------------
+// Review round 10 (#197): residents share one message slot
+// ---------------------------------------------------------------------------
+
+for (const reader of ['other', 'agent'] as const) test(`R18 (${reader} read it): a message read by any resident of the shared slot is history for all of them`, async (t) => {
+  const f = await fixture({ agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }, { name: 'other', model: 'test', systemPrompt: 'test' }], server: { shouldTriggerInference: () => true } }); t.after(f.close);
+  await f.send('push/event', f.params('1', 'read_by_one', { initial: true }));
+  const internals = f.framework as unknown as { pendingRequests: Array<{ agentName: string }> };
+  internals.pendingRequests = internals.pendingRequests.filter((r) => r.agentName === reader);
+  f.alwaysRespond();
+  await f.framework.runUntilIdle();
+  assert(f.lastRequest().includes('read_by_one'), `${reader} read it`);
+  const edit = await f.send('push/event', f.params('2', 'later_edit'));
+  assert.equal(edit.result.coalesce.outcome, 'appended');
+  for (const name of ['agent', 'other']) {
+    const ctx = JSON.stringify(f.framework.getAgent(name)!.getContextManager().getAllMessages());
+    assert(ctx.includes('read_by_one') && ctx.includes('later_edit'), `${name} keeps the consumed original`);
+  }
+  const del = await f.send('push/event', f.params('3', 'deletion_notice', { retract: true }));
+  assert.equal(del.result.coalesce.outcome, 'noted');
+  assert(f.context().includes('read_by_one') && f.context().includes('deletion_notice') && !f.context().includes('later_edit'));
+});

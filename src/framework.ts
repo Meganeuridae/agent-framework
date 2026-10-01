@@ -1256,6 +1256,14 @@ export class AgentFramework {
   private coalescingSaveTimer: ReturnType<typeof setTimeout> | null = null;
   private coalescingSnapshotDirty: (() => CoalescingSnapshot) | null = null;
   private coalescingRecentReceipts: CoalescingReceiptRecord[] = [];
+  /**
+   * Agents that read the residents' shared un-namespaced message slot: every
+   * ordinary resident (their context managers are not isolated) and the
+   * subconscious (isolated, but merging that slot read-only). A message in
+   * that slot is unread only if NONE of them has compiled past it. Forks and
+   * ephemeral agents have isolated slots and are their own only readers.
+   */
+  private readonly sharedSlotAgents = new Set<Agent>();
   /** Group commit: one fsync per event-loop turn, shared by every waiter. */
   private coalescingCommit: Promise<void> | null = null;
   private inferenceRouter: InferenceRouter | null = null;
@@ -6210,6 +6218,7 @@ export class AgentFramework {
 
     const agent = new Agent(config, contextManager, this.membrane);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+    this.sharedSlotAgents.add(agent);
     const restoredSettings = this.readAgentRuntimeSettings(config.name);
     if (restoredSettings) {
       agent.restoreRuntimeSettings(
@@ -6285,6 +6294,7 @@ export class AgentFramework {
     };
     const agent = new Agent(agentConfig, contextManager, this.membrane);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+    this.sharedSlotAgents.add(agent); // reads the shared slot through its merged view
     this.agents.set(name, agent);
     this.agentConfigs.set(name, agentConfig);
     this.subconsciousAgentName = name;
@@ -7705,26 +7715,38 @@ export class AgentFramework {
     let message: ReturnType<ContextManager['getMessage']>;
     try { message = cm.getMessage(messageId); } catch { return false; }
     if (!message || message.bodyGroupId) return false;
-    // A tune-out-diverted message never enters the resident's compiled view;
-    // it is read (if at all) through the subconscious's merged view, so that
-    // agent's watermark is the one that counts. No subconscious: nobody reads it.
-    let reader: Agent = agent;
+    // Every agent that can read this message must not have compiled past it.
+    // Residents share one message slot, so a message one of them read is
+    // history for all of them (the never-rewrite rule is about the message,
+    // not the agent that happened to be asked). A tune-out-diverted message
+    // never enters a resident's compiled view; only the subconscious reads
+    // it through its merged view — no subconscious, nobody reads it.
+    let readers: Agent[];
     if ((message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut) {
       const subconscious = this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined;
       if (!subconscious) return true;
-      reader = subconscious;
+      readers = [subconscious];
+    } else {
+      readers = this.sharedSlotAgents.has(agent)
+        ? [...this.sharedSlotAgents].filter((a) => this.agents.get(a.name) === a)
+        : [agent];
     }
-    const watermark = reader.getConsumedWatermark();
-    if (!watermark || watermark.branch !== cm.currentBranch().name || message.sequence <= watermark.sequence) return false;
+    const branch = cm.currentBranch().name;
     const ts = message.timestamp instanceof Date ? message.timestamp.getTime() : Number(message.timestamp);
-    try {
-      const strategy = cm.getStrategy() as { getSummary?: (id: string) => { sourceIds?: string[]; sourceLevel?: number } | null };
-      for (const summary of cm.getSummariesInRange({ fromMs: ts, toMs: ts })) {
-        const entry = strategy.getSummary?.(summary.id);
-        if (!entry || (entry.sourceLevel ?? 0) > 0 || entry.sourceIds?.includes(messageId)) return false;
+    for (const reader of readers) {
+      const watermark = reader.getConsumedWatermark();
+      if (!watermark || watermark.branch !== branch || message.sequence <= watermark.sequence) return false;
+      // Compression is consumption (§3.3): folded into any reader's summary.
+      try {
+        const rcm = reader.getContextManager();
+        const strategy = rcm.getStrategy() as { getSummary?: (id: string) => { sourceIds?: string[]; sourceLevel?: number } | null };
+        for (const summary of rcm.getSummariesInRange({ fromMs: ts, toMs: ts })) {
+          const entry = strategy.getSummary?.(summary.id);
+          if (!entry || (entry.sourceLevel ?? 0) > 0 || entry.sourceIds?.includes(messageId)) return false;
+        }
+      } catch {
+        return false;
       }
-    } catch {
-      return false;
     }
     return true;
   }

@@ -545,9 +545,16 @@ export class Agent {
     const cm = this.contextManager as Partial<ContextManager>;
     try {
       if (typeof cm.currentBranch !== 'function' || typeof cm.getAllMessages !== 'function') return null;
-      const count = typeof cm.getMessageCount === 'function' ? cm.getMessageCount() : cm.getAllMessages().length;
-      const last = count > 0 ? cm.getAllMessages().at(-1) : undefined;
-      return { branch: cm.currentBranch().name, sequence: last?.sequence ?? 0 };
+      // The chronicle head, not this slot's last message: a compile reads
+      // everything stored on the branch so far, including messages merged in
+      // from another slot (the subconscious reads the residents' shared slot).
+      const store = typeof cm.getStore === 'function' ? cm.getStore() as { currentSequence?: () => number } : undefined;
+      let sequence = typeof store?.currentSequence === 'function' ? store.currentSequence() : undefined;
+      if (sequence === undefined) {
+        const count = typeof cm.getMessageCount === 'function' ? cm.getMessageCount() : cm.getAllMessages().length;
+        sequence = count > 0 ? cm.getAllMessages().at(-1)?.sequence ?? 0 : 0;
+      }
+      return { branch: cm.currentBranch().name, sequence };
     } catch {
       return null;
     }
