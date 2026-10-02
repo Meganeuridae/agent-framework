@@ -139,3 +139,33 @@ test('module structured results use JSON serialization and respect the existing 
   structuredContent = { bigint: 1n };
   assert.equal(await invoke(), 'Error: tool structuredContent is not JSON-serializable');
 });
+
+test('a structured result that also references large payloads keeps the text rendering with fetched paths', async () => {
+  const fw = Object.create(AgentFramework.prototype) as {
+    dispatchScriptToolCall: () => Promise<unknown>;
+    getReferenceFetcher: () => unknown;
+    handleScriptToolCall: (agent: string, tool: string, args: object) => Promise<string>;
+  };
+  const fetched: string[] = [];
+  const savedPath = 'files/references/rows.bin';
+  fw.getReferenceFetcher = () => ({
+    fetch: async (record: { testimony: { uri: string }; fetchedPath?: string }) => {
+      fetched.push(record.testimony.uri);
+      record.fetchedPath = savedPath;
+      return { ok: true };
+    },
+  });
+  const uri = 'fixture://bulk/structured-with-reference';
+  fw.dispatchScriptToolCall = async () => ({
+    success: true,
+    data: [
+      { type: 'text', text: '{"rows":3}' },
+      { type: 'resource', uri, mimeType: 'application/octet-stream', name: 'rows.bin', sizeBytes: 50_000_000 },
+    ],
+    structuredContent: { rows: 3 },
+  });
+  const out = await fw.handleScriptToolCall('test', 'fixture--export', {});
+  assert.deepEqual(fetched, [uri], 'the referenced payload is fetched for the script, as before');
+  assert.notEqual(out, '{"rows":3}', 'the bare JSON would drop the payload');
+  assert.ok(out.includes(savedPath), `the script is told where the payload was saved: ${out}`);
+});

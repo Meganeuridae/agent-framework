@@ -33,7 +33,8 @@ export function buildCodeExecutionToolDefinition(opts?: {
       "(e.g. tool 'mcpl--discord--fetch_history' is the function mcpl__discord__fetch_history, " +
       "and tool 'mcpl--dog-events--status' is mcpl__dog_events__status). " +
       'Each function takes a single dict of arguments and returns a string: tools that provide ' +
-      'structured results return them as JSON; others return their text. Parse JSON with json.loads. ' +
+      'structured results return them as JSON; others return their text, as does a result that also ' +
+      'references large payloads (with their saved file paths). Parse JSON with json.loads. ' +
       "An exact-name lookup dict is also available: tools['mcpl--discord--fetch_history']({...}). " +
       'Use top-level await; run independent calls in parallel with asyncio.gather. ' +
       'Only what you print() (plus stderr and the exit code) comes back to you — intermediate ' +

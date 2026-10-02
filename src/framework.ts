@@ -11237,6 +11237,9 @@ export class AgentFramework {
    *
    * Structured results are JSON strings. Other results use the HISTORY
    * serializer (images become placeholders), preserving the legacy fallback.
+   * So does a structured result that also carries RFC-005 references: its
+   * JSON has no place for the fetched payloads' paths, and a script must not
+   * lose a payload it could reach before structured results existed.
    */
   private async handleScriptToolCall(
     agentName: string,
@@ -11256,7 +11259,9 @@ export class AgentFramework {
     if (result.isError) {
       return `Error: ${result.error ?? 'tool call failed'}`;
     }
-    if (result.structuredContent !== undefined) {
+    const carriesReferences = Array.isArray(result.data)
+      && result.data.some((block) => classifyBlock(block).kind === 'reference');
+    if (result.structuredContent !== undefined && !carriesReferences) {
       // Do not run machine-readable data through the content-block renderer.
       // Keep the existing script protocol cap (5,000,000 characters), but
       // report overflow explicitly instead of returning malformed JSON.
