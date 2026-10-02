@@ -77,6 +77,9 @@ const DEFAULT_SCRIPT_TIMEOUT_MS = 600_000;
 const DEFAULT_IDLE_RECLAIM_MS = 300_000;
 const CANCEL_GRACE_MS = 10_000;
 
+/** The longest delay Node's timers honour (~24.8 days); a longer one fires after ~1 ms. */
+export const MAX_TIMER_MS = 2_147_483_647;
+
 /** A time limit for a message: "45s", "10 min", "2.5 h". */
 export function formatLimit(ms: number): string {
   if (ms < 120_000) return `${Math.round(ms / 1000)}s`;
@@ -171,7 +174,8 @@ export class PyRunner {
     }
 
     const execId = `e${++this.execCounter}`;
-    const deadlineMs = background?.lifetimeMs ?? opts?.deadlineMs ?? this.scriptTimeoutMs;
+    // Clamped: a deadline past Node's timer range would fire at once instead of never.
+    const deadlineMs = Math.min(MAX_TIMER_MS, background?.lifetimeMs ?? opts?.deadlineMs ?? this.scriptTimeoutMs);
     this.onWake = background?.onWake ?? null;
     const result = await new Promise<ExecResult>((resolve) => {
       const pending: PendingExec = {
@@ -401,7 +405,9 @@ export class PyRunner {
     if (!pending || pending.settled) return;
     pending.settled = true;
     // Say why the script stopped: the in-script cancellation only reads "cancelled by host".
-    if (pending.deadlineMs !== null) {
+    // Only a script that ended unsuccessfully was stopped: one that caught the cancellation
+    // and finished its work returns 0, and must not read as stopped.
+    if (pending.deadlineMs !== null && result.returnCode !== 0) {
       const note = `script stopped: it reached its ${formatLimit(pending.deadlineMs)} time limit\n`;
       // A background script reports its output tail, so the note goes there too.
       result = { ...result, stderr: result.stderr + note, ...(result.tail !== undefined ? { tail: result.tail + note } : {}) };

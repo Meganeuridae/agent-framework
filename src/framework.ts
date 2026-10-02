@@ -99,11 +99,12 @@ import {
   type ParsedImagePlaceholder,
 } from './tool-image-ledger.js';
 import { randomUUID, createHash } from 'node:crypto';
-import { PyRunner, buildInjectedTools } from './code-execution/py-runner.js';
+import { PyRunner, buildInjectedTools, formatLimit } from './code-execution/py-runner.js';
 import {
   buildCodeExecutionToolDefinition,
   CODE_EXECUTION_TOOL_NAME,
   scriptTimeLimits,
+  validateCodeExecutionConfig,
 } from './code-execution/tool-definition.js';
 import { splitProseSegments } from './prose-segments.js';
 import { cumulativeDelta } from './usage-accounting.js';
@@ -1433,6 +1434,9 @@ export class AgentFramework {
    * Create and start the framework.
    */
   static async create(config: FrameworkConfig): Promise<AgentFramework> {
+    // Before anything opens or starts: a refused config must leave nothing behind.
+    if (config.codeExecution?.enabled) validateCodeExecutionConfig(config.codeExecution);
+
     // Create or use existing store
     let store: JsStore;
     let ownsStore: boolean;
@@ -10937,6 +10941,7 @@ export class AgentFramework {
         script_id: scriptId,
         log: logPath ?? 'no writable workspace mount — output is not retrievable; only wake_agent() reaches you',
         lifetime_hours: Math.round(lifetimeMs / 3_600_000 * 10) / 10,
+        lifetime: formatLimit(lifetimeMs), // exact for short limits, which lifetime_hours rounds to 0
         note: 'The script dies if the host process restarts. Manage with code_execution {"action": "list"|"cancel"}.',
       },
     };

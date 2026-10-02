@@ -830,6 +830,49 @@ describe('code_execution per-call time limit (time_limit_ms)', () => {
     }
   });
 
+  it('PyRunner: a script that catches the cancellation and finishes is not reported as stopped', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const code = 'import asyncio\ntry:\n    await asyncio.sleep(60)\nexcept asyncio.CancelledError:\n    print("cleaned up")';
+      const result = await runner.exec(code, [], undefined, { deadlineMs: 1000 });
+      assert.strictEqual(result.returnCode, 0, result.stderr);
+      assert.match(result.stdout, /cleaned up/);
+      assert.doesNotMatch(result.stderr, /script stopped/);
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('PyRunner: a deadline beyond Node timers (~24.8 days) is clamped, not fired at once', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const result = await runner.exec('import asyncio\nawait asyncio.sleep(0.3)\nprint("done")', [], undefined, { deadlineMs: 30 * 86_400_000 });
+      assert.strictEqual(result.returnCode, 0, result.stderr);
+      assert.match(result.stdout, /done/);
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('a ceiling below the default is refused when the framework is created', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-badcfg-');
+    try {
+      await assert.rejects(
+        AgentFramework.create({
+          storePath,
+          membrane: new MockMembrane().asMembrane(),
+          agents: [],
+          modules: [],
+          syncIntervalMs: 0,
+          codeExecution: { enabled: true, scriptTimeoutMs: 600_000, maxScriptTimeoutMs: 60_000 },
+        }),
+        /maxScriptTimeoutMs \(60000\) must be at least scriptTimeoutMs \(600000\)/,
+      );
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   async function withFramework(
     codeExecution: Record<string, unknown>,
     body: (framework: AgentFramework) => Promise<void>,
@@ -858,7 +901,7 @@ describe('code_execution per-call time limit (time_limit_ms)', () => {
   it('the tool tells the agent its time limit and offers time_limit_ms', async () => {
     await withFramework({ scriptTimeoutMs: 300_000, maxScriptTimeoutMs: 1_800_000 }, async (framework) => {
       const tool = framework.getAllTools().find((t) => t.name === 'code_execution')!;
-      assert.match(tool.description, /A script is stopped after 5 min; pass time_limit_ms to set this call's limit \(at most 30 min\)/);
+      assert.match(tool.description, /A foreground script is stopped after 5 min; pass time_limit_ms to set this call's limit \(at most 30 min; a background script runs up to 24 h\)/);
       const props = (tool.inputSchema as { properties: Record<string, { description: string }> }).properties;
       assert.match(props.time_limit_ms.description, /Default 300000, at most 1800000/);
     });
@@ -911,8 +954,9 @@ describe('code_execution per-call time limit (time_limit_ms)', () => {
     await withFramework({ backgroundMaxLifetimeMs: 1500 }, async (framework) => {
       const r = await run(framework, { code: 'import asyncio\nawait asyncio.sleep(60)', background: true, time_limit_ms: 60_000 });
       assert.strictEqual(r.success, true);
-      const data = r.data as { script_id: string; time_limit_note?: string };
+      const data = r.data as { script_id: string; time_limit_note?: string; lifetime: string };
       assert.strictEqual(data.time_limit_note, "time_limit_ms 60000 was capped at 1500, this deployment's maximum");
+      assert.strictEqual(data.lifetime, '2s', 'a short lifetime is reported exactly, not rounded to 0 hours');
       let status = 'running';
       const until = Date.now() + 15_000;
       while (status === 'running' && Date.now() < until) {
