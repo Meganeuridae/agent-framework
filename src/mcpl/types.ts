@@ -165,6 +165,15 @@ export interface McplCapabilities {
  */
 export interface McplHostCapabilities {
   version: string;
+  /** RFC-006 support, independent of capability grants. */
+  eventCoalescing?: boolean | {
+    pushEvents?: boolean;
+    channelsIncoming?: boolean;
+    deferred?: boolean;
+    channelScopedPush?: boolean;
+    /** Retry-window guarantee in ms (integer ≥ 3,600,000; default 3,600,000). */
+    retryWindowMs?: number;
+  };
   pushEvents?: boolean;
   contextHooks?: {
     beforeInference?: boolean | {
@@ -653,6 +662,21 @@ export interface StateRollbackResult {
  * Spec Section 9.1.
  */
 export interface PushEventParams {
+  /** RFC-006 event coalescing (mcpl PR #5, revision 7). */
+  coalesce?: {
+    /** Subject key, 1..256 UTF-8 bytes, opaque to the host. */
+    key: string;
+    /** push/event only: address a registered channel's subject namespace. */
+    channelId?: string;
+    /** push/event only: deferred mode — the host calls push/render at assembly. */
+    deferred?: boolean;
+    /** The subject ceased to exist; `payload.content` is the deletion notice. */
+    retract?: boolean;
+    /** No earlier occurrence of this subject was ever sent (§3.3). */
+    initial?: boolean;
+    /** deferred only; ≤ 4 KiB serialized; server-private, echoed by push/render. */
+    data?: unknown;
+  };
   /** Declaring feature set */
   featureSet: string;
 
@@ -680,6 +704,10 @@ export interface PushEventParams {
  * Spec Section 9.3.
  */
 export interface PushEventResult {
+  coalesce?: {
+    outcome: 'first' | 'replaced' | 'appended' | 'retracted' | 'noted' | 'consumed';
+    priorEventId?: string;
+  };
   /** Whether the event was accepted */
   accepted: boolean;
 
@@ -1116,6 +1144,8 @@ export interface ChannelsPublishResult {
  * Spec Section 14.3.
  */
 export interface ChannelIncomingMessage {
+  eventId?: string;
+  coalesce?: Omit<NonNullable<PushEventParams['coalesce']>, 'channelId' | 'deferred'>;
   /** Channel this message came from */
   channelId: string;
 
@@ -1163,6 +1193,7 @@ export interface ChannelsIncomingResult {
 
 /** Result for a single incoming message. */
 export interface ChannelIncomingMessageResult {
+  coalesce?: PushEventResult['coalesce'];
   messageId: string;
   accepted: boolean;
   conversationId?: string;

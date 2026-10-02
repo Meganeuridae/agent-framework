@@ -26,6 +26,7 @@ import type {
   ChannelsIncomingParams,
   ChannelsIncomingResult,
   ChannelIncomingMessageResult,
+  ChannelIncomingMessage,
   ChannelsPublishParams,
   ChannelsOpenResult,
   ChannelHistoryRequest,
@@ -36,6 +37,7 @@ import type { McplServerRegistry } from './server-registry.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
 import { expandCoreTags } from './tags.js';
+import { validateCoalescedContent } from './push-coalescer.js';
 import { CapabilityGrant } from './capability-grant.js';
 
 // ============================================================================
@@ -452,6 +454,17 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
 // ============================================================================
 
 interface ChannelRegistryOptions {
+  /**
+   * RFC-006: an admitted `channels/incoming` message carrying `coalesce`, with
+   * the event the ordinary path would have queued. The handler decides
+   * replace / append / withdraw and returns the per-message result. Throws a
+   * `CoalesceError` for a malformed or unauthorized occurrence.
+   */
+  handleCoalescedIncoming?: (
+    serverId: string,
+    message: ChannelIncomingMessage,
+    event: McplChannelIncomingEvent,
+  ) => Promise<ChannelIncomingMessageResult>;
   /** Chronicle store used for durable desired channel lifecycle state. */
   store?: JsStore;
   /** Callback to determine whether an incoming message should trigger inference. */
@@ -643,6 +656,7 @@ export class ChannelRegistry {
   /** One-time migration inputs from the retired recipe auto-open policy. */
   private legacyPolicies = new Map<string, 'auto' | 'manual' | string[]>();
   private migratedLegacyPolicies = new Set<string>();
+  private handleCoalescedIncoming?: ChannelRegistryOptions['handleCoalescedIncoming'];
 
   constructor(
     serverRegistry: McplServerRegistry,
@@ -658,6 +672,7 @@ export class ChannelRegistry {
       ) => void;
     },
   ) {
+    this.handleCoalescedIncoming = options?.handleCoalescedIncoming;
     this.serverRegistry = serverRegistry;
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -838,14 +853,23 @@ export class ChannelRegistry {
    * Converts each message's content, pushes McplChannelIncomingEvent to the
    * queue, and responds with per-message results.
    */
-  handleIncoming(
+  async handleIncoming(
     serverId: string,
     params: ChannelsIncomingParams,
     responder?: Responder,
-  ): void {
+  ): Promise<void> {
     const results: ChannelIncomingMessageResult[] = [];
 
     for (const message of params.messages) {
+      if (!message || typeof message.channelId !== 'string' || !message.channelId
+        || typeof message.messageId !== 'string' || !message.messageId) {
+        results.push({
+          messageId: typeof message?.messageId === 'string' ? message.messageId : '',
+          accepted: false,
+          reason: message?.coalesce !== undefined ? 'coalesce_invalid' : 'invalid channel/message identity',
+        });
+        continue;
+      }
       // §14.5 FIRST, before ANY semantic processing: admission against the
       // actually-registered channel precedes tag expansion and content
       // conversion — decoding an unregistered sender's payload (including
@@ -890,6 +914,17 @@ export class ChannelRegistry {
 
       // ACCEPTED from here down: semantic processing only for admitted
       // messages. §16.3 core-tag closure, then content conversion.
+      const coalesced = message.coalesce !== undefined && !!this.handleCoalescedIncoming;
+      if (coalesced) {
+        // RFC-006 §13: malformed content on a coalesced item is that item's
+        // failure, not the batch's — check the shape before converting.
+        try {
+          validateCoalescedContent(message.content);
+        } catch (error) {
+          results.push({ messageId: message.messageId, accepted: false, reason: 'coalesce_invalid' });
+          continue;
+        }
+      }
       if (message.tags) message.tags = expandCoreTags(message.tags);
       const convertedContent: ContentBlock[] = message.content.map(convertBlock);
 
@@ -897,16 +932,19 @@ export class ChannelRegistry {
       // deliberately after §14.5 validation: a rejected message from an
       // unregistered channel must not retarget outbound speech (the locus is
       // exactly the authority a self-attested channel would be stealing).
-      this.defaultPublishChannel = message.channelId;
-      this.defaultPublishMessageId = message.messageId;
-      this.defaultPublishThreadId = message.threadId;
-      {
+      // A coalesced item is "accepted" only once the coalescer admits it, so
+      // for those this runs after the hook (below).
+      const markAccepted = () => {
+        this.defaultPublishChannel = message.channelId;
+        this.defaultPublishMessageId = message.messageId;
+        this.defaultPublishThreadId = message.threadId;
         // A server sending channels/incoming is authoritative evidence that
         // the transport is actually open. This repairs transient status only;
         // durable desired state still changes exclusively through lifecycle
         // operations.
         this.channels.get(incomingKey)!.open = true;
-      }
+      };
+      if (!coalesced) markAccepted();
 
       // Determine whether to trigger inference
       let triggerInference = true;
@@ -944,6 +982,26 @@ export class ChannelRegistry {
         ...(message.tags ? { tags: message.tags } : {}),
         triggerInference,
       };
+
+      if (coalesced) {
+        // RFC-006 §14.3: a coalesced message is admitted like any other and
+        // then handed, with the event the ordinary path would have queued, to
+        // the coalescer, which replaces, appends or withdraws. Malformed
+        // `coalesce` is a per-message failure; siblings are unaffected.
+        try {
+          const result = await this.handleCoalescedIncoming!(serverId, message, event);
+          if (result.accepted) markAccepted();
+          results.push(result);
+        } catch (error) {
+          const err = error as Error & { code?: number };
+          results.push({
+            messageId: message.messageId,
+            accepted: false,
+            reason: err.code === -32602 ? 'coalesce_invalid' : err.message,
+          });
+        }
+        continue;
+      }
 
       // Push to the processing queue
       // Cast through unknown because McplChannelIncomingEvent matches the
@@ -1155,6 +1213,18 @@ export class ChannelRegistry {
    * Get the descriptor for a channel by its channelId (first match across
    * servers). Used by the conversation router for DM classification.
    */
+  /**
+   * RFC-006 §3.2: is `channelId` registered BY `serverId` through a server
+   * declaration (channels/register, channels/changed) or an authorized open?
+   * A placeholder minted from a push's `origin` (ensureChannelRegistered)
+   * does not count: a channel id appearing in an untrusted field is not a
+   * registration.
+   */
+  isDeclaredChannel(serverId: string, channelId: string): boolean {
+    const entry = this.channels.get(`${serverId}:${channelId}`);
+    return !!entry && !(entry.descriptor.metadata as { lazyRegistered?: boolean } | undefined)?.lazyRegistered;
+  }
+
   getDescriptor(channelId: string): ChannelDescriptor | undefined {
     return this.findChannelEntry(channelId)?.descriptor;
   }

@@ -209,6 +209,21 @@ export type TraceEvent =
       messageId: string;
       source: string;
     })
+  /** An unread message withdrawn or replaced by its sender (RFC-006). */
+  | (TraceEventBase & {
+      type: 'message:removed';
+      messageId: string;
+      source: string;
+    })
+  /** RFC-006 coalescing decision record (received / displaced / removed /
+   *  rendered / revoked / render-cancelled / late-render / render-failed). */
+  | (TraceEventBase & {
+      type: 'mcpl:coalescing';
+      kind: string;
+      subject?: string;
+      eventId?: string;
+      [key: string]: unknown;
+    })
 
   // EventGate lifecycle
   | (TraceEventBase & {

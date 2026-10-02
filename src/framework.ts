@@ -69,7 +69,13 @@ import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
 import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
 import { ToolLifecycleEmitter, parseToolObserveParams } from './mcpl/tool-lifecycle.js';
 import { BUILTIN_TOOL_CLASSES, normalizeClassTable, parseDeclaredClasses, resolveToolClass, type ToolClass } from './mcpl/tool-classes.js';
-import { PushHandler, type McplPushEvent } from './mcpl/push-handler.js';
+import { PushHandler, convertBlock as convertPushBlock, type McplPushEvent } from './mcpl/push-handler.js';
+import {
+  PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, validateCoalesceMember, validateCoalescedContent,
+  coalescingSubjectKey, type CoalescedOccurrence, type CoalescingPlacement, type CoalescingSnapshot,
+  type CoalescingReceiptRecord,
+} from './mcpl/push-coalescer.js';
+import type { ChannelIncomingMessage, ChannelIncomingMessageResult, McplContentBlock, PushEventResult } from './mcpl/types.js';
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
@@ -92,7 +98,7 @@ import {
   splitPreservingImageSlots,
   type ParsedImagePlaceholder,
 } from './tool-image-ledger.js';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { PyRunner, buildInjectedTools } from './code-execution/py-runner.js';
 import {
   buildCodeExecutionToolDefinition,
@@ -411,6 +417,35 @@ import {
 const FRAMEWORK_STATE_ID = 'framework/state';
 /** Snapshot slot mirroring context writes deferred while quiesced (#122). */
 const DEFERRED_WRITES_ID = 'framework/deferred-writes';
+/** The event a coalesced occurrence delivers through — one per lane. */
+interface CoalescedChannelEvent {
+  type: 'mcpl:channel-incoming';
+  serverId: string;
+  channelId: string;
+  messageId: string;
+  threadId?: string;
+  author: { id: string; name: string };
+  content: ContentBlock[];
+  timestamp: string;
+  metadata?: Record<string, unknown>;
+  tags?: string[];
+  triggerInference?: boolean;
+  targetAgents?: string[];
+  coalescingSubject?: string;
+  /** Occurrence id (RFC-006 §3.1); channel messages carry it only when coalesced. */
+  eventId?: string;
+  /** RFC-006 assembly: materialized for this agent's turn (store directly). */
+  assemblingFor?: string;
+  /** RFC-006 §3.2: deliver into this agent only (replacement / notice audience). */
+  deliverTo?: string;
+}
+type CoalescedDelivery =
+  | { lane: 'channel'; event: CoalescedChannelEvent }
+  | { lane: 'push'; event: McplPushEvent };
+/** RFC-006 coalescing bookkeeping: receipts (retry window) + subject history. */
+const COALESCING_STATE_ID = 'mcpl/coalescing';
+/** Receipts written since the last snapshot flush (bridges the throttle window). */
+const COALESCING_RECENT_ID = 'mcpl/coalescing-recent';
 /** Above this serialized size the deferred-write mirror is skipped (kept in
  *  memory only) rather than rewriting a multi-MB snapshot per deferral. */
 const DEFERRED_WRITES_PERSIST_CAP_BYTES = 4 * 1024 * 1024;
@@ -1226,6 +1261,24 @@ export class AgentFramework {
     'BUILTIN_TOOL_CLASSES',
   );
   private pushHandler: PushHandler | null = null;
+  /** RFC-006 coalescing (see mcpl/push-coalescer.ts for the design). */
+  private pushCoalescer: PushCoalescer<CoalescedDelivery> | null = null;
+  /** Both lanes are admitted in arrival order: a create, edit and delete of
+   *  one subject must not overtake one another while routing awaits. */
+  private coalescingAdmission: Promise<unknown> = Promise.resolve();
+  private coalescingSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  private coalescingSnapshotDirty: (() => CoalescingSnapshot) | null = null;
+  private coalescingRecentReceipts: CoalescingReceiptRecord[] = [];
+  /**
+   * Agents that read the residents' shared un-namespaced message slot: every
+   * ordinary resident (their context managers are not isolated) and the
+   * subconscious (isolated, but merging that slot read-only). A message in
+   * that slot is unread only if NONE of them has compiled past it. Forks and
+   * ephemeral agents have isolated slots and are their own only readers.
+   */
+  private readonly sharedSlotAgents = new Set<Agent>();
+  /** Group commit: one fsync per event-loop turn, shared by every waiter. */
+  private coalescingCommit: Promise<void> | null = null;
   private inferenceRouter: InferenceRouter | null = null;
   private channelRegistry: ChannelRegistry | null = null;
   private checkpointManager: CheckpointManager | null = null;
@@ -1403,6 +1456,13 @@ export class AgentFramework {
       store.registerState({ id: DEFERRED_WRITES_ID, strategy: 'snapshot' });
     } catch {
       // Already registered
+    }
+    for (const id of [COALESCING_STATE_ID, COALESCING_RECENT_ID]) {
+      try {
+        store.registerState({ id, strategy: 'snapshot' });
+      } catch {
+        // Already registered
+      }
     }
 
     try {
@@ -1802,6 +1862,8 @@ export class AgentFramework {
    * Stop the event loop.
    */
   async stop(): Promise<void> {
+    this.pushCoalescer?.suspend();
+    this.flushCoalescingSnapshot();
     this.running = false;
     // Flushed-but-unsynced deferred writes: sync and ack now, while the
     // store is still open, rather than leaving them to a reboot replay.
@@ -3870,6 +3932,8 @@ export class AgentFramework {
       });
 
       const agent = new Agent(config, contextManager, this.membrane);
+    agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+      agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.ephemeralCandidates.set(agent, contextManager);
 
       const cleanup = () => {
@@ -6174,6 +6238,8 @@ export class AgentFramework {
     });
 
     const agent = new Agent(config, contextManager, this.membrane);
+    agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+    this.sharedSlotAgents.add(agent);
     const restoredSettings = this.readAgentRuntimeSettings(config.name);
     if (restoredSettings) {
       agent.restoreRuntimeSettings(
@@ -6248,6 +6314,8 @@ export class AgentFramework {
       allowedTools: [...SUBCONSCIOUS_TOOL_NAMES, 'think', 'skip_reply', 'end_turn'],
     };
     const agent = new Agent(agentConfig, contextManager, this.membrane);
+    agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+    this.sharedSlotAgents.add(agent); // reads the shared slot through its merged view
     this.agents.set(name, agent);
     this.agentConfigs.set(name, agentConfig);
     this.subconsciousAgentName = name;
@@ -6657,6 +6725,17 @@ export class AgentFramework {
       this.handleMcplPushEvent(event as unknown as McplPushEvent);
     }
 
+    await this.dispatchProcessEventToModules(event, startTime);
+  }
+
+  /**
+   * The module half of handleProcessEvent: every module's onProcess, their
+   * responses, the tool-call dispatch, the completion trace and the process
+   * log. Shared with RFC-006 coalesced deliveries, which bypass the queue
+   * (the coalescer needs the placement synchronously) but must still reach
+   * modules exactly like the ordinary deliveries do.
+   */
+  private async dispatchProcessEventToModules(event: ProcessEvent, startTime = Date.now()): Promise<void> {
     // Dispatch to all modules, tracking responses with module names
     const responses: ModuleProcessResponse[] = [];
     for (const module of this.moduleRegistry.getAllModules()) {
@@ -6780,9 +6859,16 @@ export class AgentFramework {
     tags?: string[];
     triggerInference?: boolean;
     targetAgents?: string[];
-  }): Promise<void> {
+    /** RFC-006: set when the coalescer delivers; rides the wake it queues. */
+    coalescingSubject?: string;
+    eventId?: string;
+    assemblingFor?: string;
+    deliverTo?: string;
+  }): Promise<CoalescingPlacement | undefined> {
     const metadata: Record<string, unknown> = {
       ...event.metadata,
+      ...(event.eventId ? { eventId: event.eventId } : {}),
+      ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
       channelId: event.channelId,
       messageId: event.messageId,
       author: event.author,
@@ -6795,9 +6881,31 @@ export class AgentFramework {
     // Per-channel conversation routing: messages go to the channel's fork
     // agent (spawned from the template on first qualifying message), never
     // to the primary conversation.
-    if (this.conversationRouter) {
-      await this.routeConversationIncoming(event, metadata);
-      return;
+    // RFC-006 §3.2: a replacement or deletion notice follows the delivery it
+    // corrects — into the agent that holds (or read) the prior occurrence,
+    // never a context fresh routing would pick. Gone agent → delivered nowhere.
+    if (event.deliverTo) {
+      const target = this.agents.get(event.deliverTo);
+      if (!target) return undefined;
+      if (this.conversationRouter && this.conversationAgentHomes.has(target.name)) {
+        metadata.triggered = event.triggerInference ?? false;
+        const id = target.getContextManager().addMessage('user', event.content, metadata);
+        this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
+        if (event.triggerInference) {
+          this.pendingRequests.push({
+            agentName: target.name, reason: 'mcpl:channel-incoming', source: event.serverId, timestamp: Date.now(),
+            channelId: event.channelId,
+            counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
+            addressed: isAddressedMessage(event.tags, event.metadata),
+            ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
+          });
+        }
+        return { agent: target.name, messageId: id };
+      }
+      if (this.conversationRouter) return undefined; // the trunk never holds channel traffic
+      event = { ...event, targetAgents: [target.name] };
+    } else if (this.conversationRouter) {
+      return this.routeConversationIncoming(event, metadata);
     }
 
     // Addressed-while-closed invitation — parity with the push-event path
@@ -6844,7 +6952,8 @@ export class AgentFramework {
       metadata.tuneOut = { epochId: divert.epochId };
     }
 
-    const id = this.addMessage('user', incomingContent, metadata);
+    const placement: CoalescingPlacement = { agent: '' };
+    const id = this.addMessage('user', incomingContent, metadata, { placement, bypassDeferralFor: event.assemblingFor });
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
 
     if (event.triggerInference && !divert) {
@@ -6870,9 +6979,11 @@ export class AgentFramework {
           // Addressed messages outrank ambient chatter when a batched wake
           // picks the turn's frozen speech locus.
           addressed,
+          ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
         });
       }
     }
+    return placement.agent ? placement : undefined;
   }
 
   /**
@@ -6891,9 +7002,10 @@ export class AgentFramework {
       metadata?: Record<string, unknown>;
       tags?: string[];
       triggerInference?: boolean;
+      coalescingSubject?: string;
     },
     messageMetadata: Record<string, unknown>,
-  ): Promise<void> {
+  ): Promise<CoalescingPlacement | undefined> {
     const router = this.conversationRouter!;
     const descriptor = this.channelRegistry?.getDescriptor(event.channelId);
 
@@ -6970,8 +7082,10 @@ export class AgentFramework {
         channelId: event.channelId,
         counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
         addressed: isAddressedMessage(event.tags, event.metadata),
+        ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
       });
     }
+    return { agent: agent.name, messageId: id };
   }
 
   /**
@@ -7024,6 +7138,8 @@ export class AgentFramework {
 
       const config: AgentConfig = { ...templateConfig, name, strategy: undefined };
       const agent = new Agent(config, contextManager, this.membrane);
+    agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+      agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.agents.set(name, agent);
       this.agentConfigs.set(name, config);
       this.conversationAgentHomes.set(name, channelId);
@@ -7238,10 +7354,454 @@ export class AgentFramework {
     };
   }
 
+  // ==========================================================================
+  // RFC-006 event coalescing (see mcpl/push-coalescer.ts for the design)
+  // ==========================================================================
+
+  /**
+   * RFC-006 §3.2 binding identity: the configured server id bound to its
+   * endpoint/command. Survives reconnects to the same peer; changes when the
+   * id is reassigned to another endpoint (restartMcplServer with a new config).
+   */
+  private coalescingBinding(serverId: string): string {
+    const config = this.mcplServerConfigs.get(serverId);
+    return createHash('sha256').update(JSON.stringify([serverId, config?.url ?? null, config?.command ?? null, config?.args ?? null])).digest('hex').slice(0, 16);
+  }
+
+  private initializePushCoalescer(): void {
+    const coalescer = new PushCoalescer<CoalescedDelivery>({
+      isUnread: (p) => this.isUnreadPlacement(p),
+      remove: (p) => this.removePlacement(p),
+      deliver: (occ, materialized, assemblingFor) => this.deliverCoalesced(occ, materialized, assemblingFor),
+      wakeForBatch: (occ) => this.wakeForCoalescedBatch(occ),
+      cancelWake: (subject) => this.cancelCoalescedWakes(subject),
+      authorized: (occ) => this.coalescedAuthorized(occ),
+      audience: (occ) => this.coalescedAudience(occ),
+      render: (occ, params) => {
+        const server = this.mcplServerRegistry?.getServer(occ.serverId);
+        if (!server?.isConnected) throw new Error('server disconnected');
+        return server.sendPushRender(params);
+      },
+      audit: (record) => this.emitTrace({ type: 'mcpl:coalescing', ...record }),
+      save: (snapshot) => this.scheduleCoalescingSnapshot(snapshot),
+      recordReceipt: (record) => {
+        // Written now, not at the throttled flush: an acknowledged acceptance
+        // must not lose its receipt, the subject's birth, or (deferred) the
+        // accepted work itself to a crash. A failure here fails the acceptance.
+        this.coalescingRecentReceipts.push(record);
+        this.store.setStateJson(COALESCING_RECENT_ID, this.coalescingRecentReceipts);
+      },
+      wasPublished: (subject, eventId) => {
+        // Boot-time only: the occurrence's durable delivery identity
+        // (subject + eventId in message metadata) in any agent's context.
+        for (const agent of this.agents.values()) {
+          try {
+            if (agent.getContextManager().getAllMessages().some((m) =>
+              m.metadata?.coalescingSubject === subject && m.metadata?.eventId === eventId)) return true;
+          } catch { /* a context that cannot be read cannot prove publication */ }
+        }
+        return false;
+      },
+      commit: () => this.commitCoalescingDurable(),
+      saveNow: (snapshot) => {
+        if (this.coalescingSaveTimer) { clearTimeout(this.coalescingSaveTimer); this.coalescingSaveTimer = null; }
+        this.coalescingSnapshotDirty = null;
+        this.store.setStateJson(COALESCING_STATE_ID, snapshot);
+        this.coalescingRecentReceipts = [];
+        this.store.setStateJson(COALESCING_RECENT_ID, []);
+      },
+    });
+    try {
+      coalescer.restore(this.store.getStateJson(COALESCING_STATE_ID) as CoalescingSnapshot | null);
+      const recent = this.store.getStateJson(COALESCING_RECENT_ID) as CoalescingReceiptRecord[] | null;
+      if (Array.isArray(recent)) {
+        coalescer.restoreReceipts(recent);
+        // Until the next snapshot flush checkpoints the recovered state, these
+        // records are its only durable form: keep them in the writable buffer
+        // so the next acceptance appends to them instead of replacing them.
+        this.coalescingRecentReceipts = recent;
+      }
+    } catch (err) {
+      console.error('[coalescing] could not restore coalescing state; starting with unknown history:', err);
+    }
+    this.pushCoalescer = coalescer;
+    // Batches restored from a snapshot still owe the agent a wake (§14 v41).
+    for (const occ of coalescer.pendingBatchOccurrences()) void this.wakeForCoalescedBatch(occ);
+  }
+
+  /**
+   * Durability barrier for coalescing (RFC-006 §3.1/§3.2): everything
+   * written so far is fsynced before the caller proceeds. Group-committed —
+   * all acceptances that arrive in one event-loop turn share one
+   * `store.sync()` — so throughput is bounded by fsync rate per batch, not
+   * per message.
+   */
+  private commitCoalescingDurable(): Promise<void> {
+    if (!this.coalescingCommit) {
+      this.coalescingCommit = new Promise<void>((resolve, reject) => {
+        setImmediate(() => {
+          this.coalescingCommit = null;
+          try { this.store.sync(); resolve(); } catch (err) { reject(err); }
+        });
+      });
+    }
+    return this.coalescingCommit;
+  }
+
+  private scheduleCoalescingSnapshot(snapshot: () => CoalescingSnapshot): void {
+    this.coalescingSnapshotDirty = snapshot;
+    if (this.coalescingSaveTimer) return;
+    const timer = setTimeout(() => this.flushCoalescingSnapshot(), 2_000);
+    timer.unref?.();
+    this.coalescingSaveTimer = timer;
+  }
+
+  private flushCoalescingSnapshot(): void {
+    if (this.coalescingSaveTimer) { clearTimeout(this.coalescingSaveTimer); this.coalescingSaveTimer = null; }
+    const snapshot = this.coalescingSnapshotDirty;
+    this.coalescingSnapshotDirty = null;
+    if (!snapshot) return;
+    try {
+      this.store.setStateJson(COALESCING_STATE_ID, snapshot());
+      this.coalescingRecentReceipts = [];
+      this.store.setStateJson(COALESCING_RECENT_ID, []);
+    } catch (err) {
+      console.error('[coalescing] could not persist coalescing state:', err);
+    }
+  }
+
+  /** Serialize both lanes' admissions: create, edit and delete of one subject stay ordered. */
+  private admitCoalesced<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.coalescingAdmission.then(work, work);
+    this.coalescingAdmission = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private handleCoalescedIncoming(
+    serverId: string,
+    message: ChannelIncomingMessage,
+    event: CoalescedChannelEvent,
+  ): Promise<ChannelIncomingMessageResult> {
+    return this.admitCoalesced(async () => {
+      if (!this.pushCoalescer) throw new CoalesceError('coalesce', 'coalescing unavailable', -32000);
+      validateCoalesceMember(message.coalesce, 'channel');
+      if (typeof message.eventId !== 'string' || !message.eventId) {
+        throw new CoalesceError('eventId', 'eventId is required with coalesce');
+      }
+      if (typeof message.timestamp !== 'string') throw new CoalesceError('timestamp', 'timestamp is required');
+      validateCoalescedContent(message.content);
+      const c = message.coalesce;
+      const result = await this.pushCoalescer.accept({
+        serverId,
+        binding: this.coalescingBinding(serverId),
+        scope: { kind: 'channel', id: message.channelId },
+        key: c.key,
+        eventId: message.eventId,
+        timestamp: message.timestamp,
+        retract: !!c.retract,
+        deferred: false,
+        initial: !!c.initial,
+        tags: event.tags,
+        content: message.content,
+        identity: { messageId: message.messageId, author: message.author, threadId: message.threadId },
+        event: { lane: 'channel', event: { ...event, eventId: message.eventId } },
+      });
+      return { messageId: message.messageId, accepted: true, coalesce: result.coalesce };
+    });
+  }
+
+  private handleCoalescedPush(serverId: string, params: PushEventParams, event: McplPushEvent): Promise<PushEventResult> {
+    return this.admitCoalesced(async () => {
+      if (!this.pushCoalescer) throw new CoalesceError('coalesce', 'coalescing unavailable', -32000);
+      validateCoalesceMember(params.coalesce, 'push');
+      if (typeof params.eventId !== 'string' || !params.eventId) throw new CoalesceError('eventId', 'eventId is required');
+      if (typeof params.timestamp !== 'string') throw new CoalesceError('timestamp', 'timestamp is required');
+      validateCoalescedContent(params.payload?.content);
+      const c = params.coalesce;
+      if (c.channelId) this.assertChannelScopedPush(serverId, c.channelId);
+      const origin = params.origin ?? {};
+      const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
+      return this.pushCoalescer.accept({
+        serverId,
+        binding: this.coalescingBinding(serverId),
+        featureSet: params.featureSet,
+        scope: c.channelId ? { kind: 'channel', id: c.channelId } : { kind: 'featureSet', id: params.featureSet },
+        key: c.key,
+        eventId: params.eventId,
+        timestamp: params.timestamp,
+        retract: !!c.retract,
+        deferred: !!c.deferred,
+        initial: !!c.initial,
+        data: c.data,
+        tags: event.tags,
+        content: params.payload.content,
+        ...(c.channelId ? {
+          identity: {
+            ...(str(origin.messageId) ? { messageId: str(origin.messageId) } : {}),
+            ...(str(origin.threadId) ? { threadId: str(origin.threadId) } : {}),
+            ...(str(origin.authorId) ? { author: { id: str(origin.authorId)!, name: str(origin.authorName) ?? str(origin.authorId)! } } : {}),
+          },
+        } : {}),
+        event: { lane: 'push', event },
+      });
+    });
+  }
+
+  /** §3.2: a channel-scoped push needs what a channels/incoming message needs. */
+  private assertChannelScopedPush(serverId: string, channelId: string): void {
+    const server = this.mcplServerRegistry?.getServer(serverId);
+    if (!server?.policyEstablished || !server.grant.has('channels.incoming')) {
+      throw new CoalesceError('coalesce.channelId', 'Channel not permitted', -32017);
+    }
+    if (!this.channelRegistry?.isDeclaredChannel(serverId, channelId)) {
+      throw new CoalesceError('coalesce.channelId', 'Unknown channel', -32023);
+    }
+  }
+
+  private coalescedAuthorized(occ: CoalescedOccurrence<CoalescedDelivery>): boolean {
+    const server = this.mcplServerRegistry?.getServer(occ.serverId);
+    if (!server?.isConnected || !server.policyEstablished) return false;
+    // §3.2: work admitted under another binding (the id since reassigned to a
+    // different endpoint) never acquires the replacement peer's authority —
+    // and its private notice data is never sent to that peer.
+    if (occ.binding !== this.coalescingBinding(occ.serverId)) return false;
+    if (occ.event.lane === 'push') {
+      if (!server.grant.has('pushEvents')) return false;
+      try { this.featureSetManager?.validateInbound(occ.serverId, occ.event.event.featureSet); } catch { return false; }
+    }
+    if (occ.scope.kind === 'channel' || occ.event.lane === 'channel') {
+      // §3.2 / §5.4 rule 4: the channel's CURRENT authority, whichever lane.
+      if (!server.grant.has('channels.incoming')) return false;
+      if (occ.event.lane === 'push') return this.channelRegistry?.isDeclaredChannel(occ.serverId, occ.scope.id) ?? false;
+      return !!this.channelRegistry?.getDescriptor(occ.scope.id);
+    }
+    return true;
+  }
+
+  private async coalescedAudience(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<string[]> {
+    if (occ.deliverTo) return this.agents.has(occ.deliverTo) ? [occ.deliverTo] : [];
+    const explicit = occ.event.event.targetAgents;
+    if (explicit) return explicit.filter((n) => this.agents.has(n));
+    if (occ.scope.kind === 'channel' && this.conversationRouter) {
+      const router = this.conversationRouter;
+      const bound = router.getBinding(occ.scope.id)?.agentName;
+      if (bound) return this.agents.has(bound) ? [bound] : [];
+      // No fork yet: the same bind decision an incoming message would get. A
+      // batch that qualifies spawns its fork now so it has someone to wake.
+      const metadata = (occ.event.lane === 'channel' ? occ.event.event.metadata : occ.event.event.origin) ?? {};
+      const decision = router.route({
+        channelId: occ.scope.id,
+        mentioned: metadata.mentioned === true,
+        kind: ConversationRouter.classifyChannel(this.channelRegistry?.getDescriptor(occ.scope.id), metadata),
+      });
+      if (decision.kind !== 'spawn') return decision.kind === 'unbound' ? [] : (this.agents.has(decision.agentName) ? [decision.agentName] : []);
+      try {
+        await this.createConversationAgent(decision.agentName, occ.scope.id);
+        router.bind(occ.scope.id, decision.agentName, decision.generation);
+        this.persistConversationRouterState();
+        return [decision.agentName];
+      } catch (err) {
+        console.error(`[coalescing] could not spawn a conversation agent for ${occ.scope.id}:`, err);
+        return [];
+      }
+    }
+    return [...this.agents.keys()].filter((n) => !this.conversationAgentHomes.has(n) && n !== this.subconsciousAgentName);
+  }
+
+  /** Deliver through the lane's ordinary path; report where it landed. */
+  private async deliverCoalesced(
+    occ: CoalescedOccurrence<CoalescedDelivery>,
+    materialized?: McplContentBlock[],
+    assemblingFor?: string,
+  ): Promise<CoalescingPlacement | undefined> {
+    const coalescingSubject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
+    const narrowing = occ.deliverTo ? { deliverTo: occ.deliverTo } : {};
+    if (occ.event.lane === 'channel') {
+      const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...(assemblingFor ? { assemblingFor } : {}) };
+      const placement = await this.handleMcplChannelIncoming(event);
+      await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
+      return placement;
+    }
+    if (occ.scope.kind === 'channel') {
+      // §3.2: a channel-scoped push addresses the channel's subject namespace,
+      // so it is delivered as a message OF that channel — same routing
+      // (conversation forks, tune-out, closed-channel invitation), same reply
+      // locus, and the subject's stable platform identity (§3.1, vector 43).
+      const push = occ.event.event;
+      const identity = { ...this.pushCoalescer?.identity(coalescingSubject), ...occ.identity };
+      const origin = push.origin ?? {};
+      const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
+      const event: CoalescedChannelEvent = {
+        type: 'mcpl:channel-incoming',
+        serverId: occ.serverId,
+        channelId: occ.scope.id,
+        messageId: identity.messageId ?? str(origin.messageId) ?? occ.eventId,
+        threadId: identity.threadId ?? str(origin.threadId),
+        author: identity.author ?? { id: str(origin.authorId) ?? '', name: str(origin.authorName) ?? str(origin.authorId) ?? 'Someone' },
+        content: materialized ? materialized.map(convertPushBlock) : push.content,
+        timestamp: occ.timestamp,
+        metadata: origin,
+        tags: push.tags,
+        triggerInference: assemblingFor ? false : push.triggerInference,
+        targetAgents: push.targetAgents,
+        coalescingSubject,
+        eventId: occ.eventId,
+        ...narrowing,
+        ...(assemblingFor ? { assemblingFor } : {}),
+      };
+      const placement = await this.handleMcplChannelIncoming(event);
+      await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
+      return placement;
+    }
+    const event: McplPushEvent = {
+      ...occ.event.event,
+      eventId: occ.eventId,
+      timestamp: occ.timestamp,
+      ...(materialized ? { content: materialized.map(convertPushBlock) } : {}),
+      coalescingSubject,
+      // §5.2: the materialized occurrence is consumed by the request being
+      // assembled; the wake that started it is not repeated.
+      ...(assemblingFor ? { assemblingFor, triggerInference: false } : {}),
+      ...(occ.deliverTo ? { targetAgents: [occ.deliverTo] } : {}),
+    };
+    const placement = this.handleMcplPushEvent(event);
+    await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
+    return placement;
+  }
+
+  private async wakeForCoalescedBatch(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<void> {
+    const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
+    this.cancelCoalescedWakes(subject);
+    if (occ.event.lane !== 'push' || !occ.event.event.triggerInference) return;
+    const origin = occ.event.event.origin;
+    // The wake carries the batch's channel so the turn freezes its reply
+    // locus there (the materialized delivery at assembly wakes nobody).
+    const channelId = occ.scope.kind === 'channel' ? occ.scope.id : this.derivePushEventChannel(origin)?.channelId;
+    const authorId = occ.identity?.author?.id ?? (typeof origin?.authorId === 'string' ? origin.authorId : undefined);
+    for (const agentName of await this.coalescedAudience(occ)) {
+      this.pendingRequests.push({
+        agentName,
+        reason: 'mcpl:push-event',
+        source: occ.serverId,
+        timestamp: Date.now(),
+        channelId,
+        counterparty: authorId ? `${occ.serverId}:user:${authorId}` : undefined,
+        addressed: isAddressedMessage(occ.tags, origin),
+        coalescingSubject: subject,
+      });
+    }
+  }
+
+  /** Withdraw unstarted wakes whose sole cause is this subject (§4.2). */
+  private cancelCoalescedWakes(subject: string): void {
+    this.pendingRequests = this.pendingRequests.filter((r) => r.coalescingSubject !== subject);
+    for (const cooldown of this.providerAccelerationCooldowns.values()) {
+      cooldown.heldRequests = cooldown.heldRequests.filter((r) => r.coalescingSubject !== subject);
+    }
+  }
+
+  /**
+   * A placement in the deferred queue is upgraded in place once the flush has
+   * stored it: the stored copy carries `metadata.deferredWriteId`, found by
+   * scanning the unread tail (above the watermark) — never below it.
+   */
+  private resolvePlacement(p: CoalescingPlacement): void {
+    if (!p.deferredId || this.deferredMessages.some((m) => m.id === p.deferredId)) return;
+    const agent = this.agents.get(p.agent);
+    if (!agent) return;
+    const cm = agent.getContextManager();
+    const watermark = agent.getConsumedWatermark();
+    const floor = watermark && watermark.branch === cm.currentBranch().name ? watermark.sequence : Number.POSITIVE_INFINITY;
+    const all = cm.getAllMessages();
+    for (let i = all.length - 1; i >= 0 && all[i].sequence > floor; i--) {
+      if (all[i].metadata?.deferredWriteId === p.deferredId) {
+        p.messageId = all[i].id;
+        delete p.deferredId;
+        return;
+      }
+    }
+  }
+
+  private isUnreadPlacement(p: CoalescingPlacement): boolean {
+    this.resolvePlacement(p);
+    if (p.deferredId) return this.deferredMessages.some((m) => m.id === p.deferredId);
+    if (!p.messageId) return false;
+    const agent = this.agents.get(p.agent);
+    return !!agent && this.isUnreadStoredMessage(agent, p.messageId);
+  }
+
+  /**
+   * Unread = stored, above the agent's consumed watermark on the current
+   * branch, not a body-group shard (immutable), and not folded into any
+   * summary (compression is consumption, §3.3). Conservative on every doubt.
+   */
+  private isUnreadStoredMessage(agent: Agent, messageId: MessageId): boolean {
+    const cm = agent.getContextManager();
+    let message: ReturnType<ContextManager['getMessage']>;
+    try { message = cm.getMessage(messageId); } catch { return false; }
+    if (!message || message.bodyGroupId) return false;
+    // Every agent that can read this message must not have compiled past it.
+    // Residents share one message slot, so a message one of them read is
+    // history for all of them (the never-rewrite rule is about the message,
+    // not the agent that happened to be asked). A tune-out-diverted message
+    // never enters a resident's compiled view; only the subconscious reads
+    // it through its merged view — no subconscious, nobody reads it.
+    let readers: Agent[];
+    if ((message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut) {
+      const subconscious = this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined;
+      if (!subconscious) return true;
+      readers = [subconscious];
+    } else {
+      readers = this.sharedSlotAgents.has(agent)
+        ? [...this.sharedSlotAgents].filter((a) => this.agents.get(a.name) === a)
+        : [agent];
+    }
+    const branch = cm.currentBranch().name;
+    const ts = message.timestamp instanceof Date ? message.timestamp.getTime() : Number(message.timestamp);
+    for (const reader of readers) {
+      const watermark = reader.getConsumedWatermark();
+      if (!watermark || watermark.branch !== branch || message.sequence <= watermark.sequence) return false;
+      // Compression is consumption (§3.3): folded into any reader's summary.
+      try {
+        const rcm = reader.getContextManager();
+        const strategy = rcm.getStrategy() as { getSummary?: (id: string) => { sourceIds?: string[]; sourceLevel?: number } | null };
+        for (const summary of rcm.getSummariesInRange({ fromMs: ts, toMs: ts })) {
+          const entry = strategy.getSummary?.(summary.id);
+          if (!entry || (entry.sourceLevel ?? 0) > 0 || entry.sourceIds?.includes(messageId)) return false;
+        }
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private removePlacement(p: CoalescingPlacement): boolean {
+    this.resolvePlacement(p);
+    if (p.deferredId) {
+      const before = this.deferredMessages.length;
+      this.deferredMessages = this.deferredMessages.filter((m) => m.id !== p.deferredId);
+      if (this.deferredMessages.length === before) return false;
+      if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
+      return true;
+    }
+    if (!p.messageId) return false;
+    const agent = this.agents.get(p.agent);
+    if (!agent) return false;
+    try {
+      agent.getContextManager().removeMessage(p.messageId);
+      this.emitTrace({ type: 'message:removed', messageId: p.messageId, source: 'mcpl:coalescing' });
+      return true;
+    } catch (err) {
+      console.error(`[coalescing] could not remove unread message ${p.messageId} for ${agent.name}:`, err);
+      return false;
+    }
+  }
+
   /**
    * Convert an MCPL push event to a context message.
    */
-  private handleMcplPushEvent(event: McplPushEvent): void {
+  private handleMcplPushEvent(event: McplPushEvent): CoalescingPlacement | undefined {
     const triggerChannel = this.derivePushEventChannel(event.origin);
     if (triggerChannel && this.channelRegistry) {
       this.channelRegistry.ensureChannelRegistered(
@@ -7259,6 +7819,7 @@ export class AgentFramework {
       eventId: event.eventId,
       triggered: event.triggerInference ?? false,
       ...(event.tags ? { tags: event.tags } : {}),
+      ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
     };
     // `origin.channelId` is the server-internal raw id (a bare Discord
     // snowflake) — unroutable as a locus and unresolvable by the agent. Store
@@ -7291,7 +7852,8 @@ export class AgentFramework {
       }
     }
 
-    const id = this.addMessage('user', content, metadata);
+    const placement: CoalescingPlacement = { agent: '' };
+    const id = this.addMessage('user', content, metadata, { placement, bypassDeferralFor: event.assemblingFor });
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
 
     if (event.triggerInference) {
@@ -7310,9 +7872,11 @@ export class AgentFramework {
           // they must outrank ambient chatter in a batched wake's locus
           // selection just like their channels/incoming counterparts.
           addressed: isAddressedMessage(event.tags, event.origin),
+          ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
         });
       }
     }
+    return placement.agent ? placement : undefined;
   }
 
   /**
@@ -7470,7 +8034,9 @@ export class AgentFramework {
         // route the resumed turn into the wrong channel.
         const newestByKey = new Map<string, InferenceRequest>();
         for (const request of parked) {
-          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}`;
+          // A coalesced wake is withdrawable by its subject (RFC-006 §4.2); it
+          // must not absorb an unrelated wake that would vanish with it.
+          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${request.coalescingSubject ?? ''}`;
           const prev = newestByKey.get(key);
           if (!prev || request.timestamp >= prev.timestamp) {
             newestByKey.set(key, request);
@@ -8204,6 +8770,18 @@ export class AgentFramework {
           }
         }
         this.ackDeferredWrites();
+      }
+    }
+
+    // RFC-006 §5: deferred batches for this agent render now, at the assembly
+    // boundary — after the deferred flush (same window: turn alive, compile
+    // not yet run) and before the checkpoint (they are the turn's inputs).
+    // Not on a context-budget restart: that continues the same logical turn.
+    if (attempt === 0 && trigger?.reason !== 'context_budget_restart' && this.pushCoalescer?.pendingBatches()) {
+      try {
+        await this.pushCoalescer.assemble(agent.name);
+      } catch (err) {
+        console.error(`[coalescing] assembly for ${agent.name} failed:`, err);
       }
     }
 
@@ -11255,6 +11833,14 @@ export class AgentFramework {
        * minting a second, independently replayable one.
        */
       deferredWriteId?: string;
+      /** Out-param: where the message landed (RFC-006 needs to find it again). */
+      placement?: { agent?: string; messageId?: MessageId; deferredId?: string };
+      /**
+       * RFC-006 assembly: the named agent's turn is alive but its compile has
+       * not run yet (the same window the turn-start deferred flush writes
+       * in). A message for THAT agent is stored directly instead of deferred.
+       */
+      bypassDeferralFor?: string;
     }
   ): MessageId {
     // Route to the named agent, else the primary (not ephemeral subagents).
@@ -11304,6 +11890,7 @@ export class AgentFramework {
       : this.pendingAssistantBlocks.size > 0;
     if (
       !hasToolResult &&
+      opts?.bypassDeferralFor !== agent.name &&
       (this.quiesced ||
         midToolCycle ||
         this.activeTurnTokens.has(agent.name) ||
@@ -11320,14 +11907,17 @@ export class AgentFramework {
       }
       this.deferredMessages.push({ id, seq: seq ?? ++this.deferredSeq, participant, content, metadata, forAgent: opts?.forAgent });
       if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
+      if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.deferredId = id; }
       return '' as MessageId; // Deferred — flushed at the target's next boundary
     }
 
-    return agent.getContextManager().addMessage(
+    const stored = agent.getContextManager().addMessage(
       participant,
       content,
       opts?.deferredWriteId ? withDeferredWriteId(metadata, opts.deferredWriteId) : metadata,
     );
+    if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; }
+    return stored;
   }
 
   /**
@@ -11884,11 +12474,13 @@ export class AgentFramework {
       ?? (this.eventGate ? this.eventGate.asShouldTriggerCallback() : undefined);
 
     // Push events handler (Step 6)
+    this.initializePushCoalescer();
     this.pushHandler = new PushHandler(
       this.featureSetManager,
       (event) => this.pushEvent(event as unknown as ProcessEvent),
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
       triggerFilter,
+      (serverId, params, event) => this.handleCoalescedPush(serverId, params, event),
     );
 
     // Server-initiated inference router (Step 6)
@@ -11918,6 +12510,8 @@ export class AgentFramework {
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
       {
         store: this.store,
+        handleCoalescedIncoming: (serverId, message, event) =>
+          this.handleCoalescedIncoming(serverId, message, event as CoalescedChannelEvent),
         sendTypingFn: (serverId, channelId, metadata, op) => {
           const server = this.mcplServerRegistry!.getServer(serverId);
           if (server) {
@@ -11992,6 +12586,9 @@ export class AgentFramework {
     // implemented for years — are declared (AUDIT-001/issue #76 item 12).
     this.mcplHostCapabilities = {
       version: '0.5',
+      // RFC-006 (mcpl PR #5, revision 7): both lanes, deferred rendering,
+      // channel-scoped pushes, one-hour retry window.
+      eventCoalescing: { ...PUSH_COALESCING_SUPPORT },
       pushEvents: true,
       contextHooks: {
         beforeInference: true,
@@ -12968,7 +13565,7 @@ export class AgentFramework {
     ) => {
       const barrier = this.discordAwarenessBarrier;
       if (barrier) await barrier.promise;
-      this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
+      await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
     });
 
     // Handle server-initiated inference requests (Step 6)
@@ -12976,6 +13573,11 @@ export class AgentFramework {
       params: McplInferenceRequestParams,
       responder?: { id: string | number; respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
+      // RFC-006 §5.3 / SPEC §10.7: no inference from inside a render.
+      if (this.pushCoalescer?.isRendering(connection.id)) {
+        responder?.respondError(-32600, 'Cannot request inference while push/render is in progress');
+        return;
+      }
       if (this.inferenceRouter && responder) {
         const barrier = this.discordAwarenessBarrier;
         if (barrier) await barrier.promise;
@@ -13066,7 +13668,7 @@ export class AgentFramework {
     ) => {
       const barrier = this.discordAwarenessBarrier;
       if (barrier) await barrier.promise;
-      this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
+      await this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
     });
 
     // Handle host-level admin commands from a surface (e.g. Discord /undo)
