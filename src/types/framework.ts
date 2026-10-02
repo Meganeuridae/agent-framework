@@ -53,7 +53,7 @@ export interface CodeExecutionConfig {
   /** Whole-script deadline: cancel → grace → SIGKILL (default 600_000 ms). */
   scriptTimeoutMs?: number;
   /**
-   * Longest deadline an agent may ask for on one call with `timeout_ms`
+   * Longest deadline an agent may ask for on one call with `time_limit_ms`
    * (default: `scriptTimeoutMs`, so agents can only shorten it until this is
    * raised). Longer requests are capped, and the result says so.
    */

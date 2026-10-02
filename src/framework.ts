@@ -10733,7 +10733,7 @@ export class AgentFramework {
       background?: unknown;
       action?: unknown;
       script_id?: unknown;
-      timeout_ms?: unknown;
+      time_limit_ms?: unknown;
     };
 
     // Management surface: the agent's own daemon fleet is inspectable and
@@ -10783,15 +10783,15 @@ export class AgentFramework {
     }
 
     // A per-call time limit, capped by the deployment's ceiling (the result says when it was capped).
-    if (input.timeout_ms !== undefined && (typeof input.timeout_ms !== 'number' || !Number.isFinite(input.timeout_ms) || input.timeout_ms < 1000)) {
-      return { success: false, error: '`timeout_ms` must be a number of milliseconds, at least 1000', isError: true };
+    if (input.time_limit_ms !== undefined && (typeof input.time_limit_ms !== 'number' || !Number.isFinite(input.time_limit_ms) || input.time_limit_ms < 1000)) {
+      return { success: false, error: '`time_limit_ms` must be a number of milliseconds, at least 1000', isError: true };
     }
     const limits = scriptTimeLimits(this.codeExecutionConfig ?? undefined);
     const ceilingMs = input.background === true ? limits.backgroundMaxMs : limits.maxMs;
-    const requestedMs = input.timeout_ms === undefined ? undefined : Math.floor(input.timeout_ms);
+    const requestedMs = input.time_limit_ms === undefined ? undefined : Math.floor(input.time_limit_ms);
     const timeLimitMs = requestedMs === undefined ? undefined : Math.min(requestedMs, ceilingMs);
     const capNote = requestedMs !== undefined && requestedMs > ceilingMs
-      ? `timeout_ms ${requestedMs} was capped at ${ceilingMs}, this deployment's maximum`
+      ? `time_limit_ms ${requestedMs} was capped at ${ceilingMs}, this deployment's maximum`
       : undefined;
 
     const agent = this.agents.get(agentName);
@@ -10870,7 +10870,7 @@ export class AgentFramework {
     }
 
     const scriptId = `bg-${++this.backgroundScriptCounter}`;
-    // The agent's timeout_ms (already capped) shortens the lifetime; it never extends it.
+    // The agent's time_limit_ms (already capped) shortens the lifetime; it never extends it.
     const lifetimeMs = timeLimitMs ?? cfg?.backgroundMaxLifetimeMs ?? 86_400_000;
 
     // Journal: a file under the agent's first read-write workspace mount so

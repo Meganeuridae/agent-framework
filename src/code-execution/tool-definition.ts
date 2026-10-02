@@ -41,8 +41,8 @@ export function buildCodeExecutionToolDefinition(opts?: {
       'what you need. Interpreter state (variables, imports) persists across code_execution ' +
       `calls but is reclaimed after ~${idleMinutes} minutes idle. A tool call that receives no ` +
       `response within ~${callTimeoutSeconds}s raises TimeoutError inside the script. ` +
-      `A script is stopped after ${formatLimit(limits.defaultMs)}; pass timeout_ms to set this call's limit ` +
-      `(at most ${formatLimit(limits.maxMs)}). ` +
+      `A script is stopped after ${formatLimit(limits.defaultMs)}; pass time_limit_ms to set this call's limit ` +
+      `(at most ${formatLimit(limits.maxMs)}). Stopping a script does not stop tools it already called. ` +
       'Use this when fanning out across many items, looping over tool calls, or when tool ' +
       'results are large and you only need a slice or summary. Call tools directly (not via ' +
       'code) when a single call answers the question or when you need to reason about each ' +
@@ -79,7 +79,7 @@ export function buildCodeExecutionToolDefinition(opts?: {
           type: 'string',
           description: 'Background script id (for action: cancel).',
         },
-        timeout_ms: {
+        time_limit_ms: {
           type: 'integer',
           description:
             `Time limit for this script in milliseconds; it is stopped when the limit is reached. ` +
@@ -94,7 +94,7 @@ export function buildCodeExecutionToolDefinition(opts?: {
 
 /**
  * A script's time limits: the default, the most an agent may ask for with
- * `timeout_ms`, and the background lifetime (default and ceiling at once).
+ * `time_limit_ms`, and the background lifetime (default and ceiling at once).
  */
 export function scriptTimeLimits(opts?: {
   scriptTimeoutMs?: number;

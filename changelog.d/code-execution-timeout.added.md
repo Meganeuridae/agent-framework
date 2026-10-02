@@ -1,4 +1,4 @@
-- `code_execution` takes an optional per-call `timeout_ms`: the time limit for
+- `code_execution` takes an optional per-call `time_limit_ms`: the time limit for
   that script, the way Claude Code's Bash tool takes a per-call timeout. It
   defaults to `codeExecution.scriptTimeoutMs` (10 min) and may go up to the new
   `codeExecution.maxScriptTimeoutMs`, which defaults to the same value, so
