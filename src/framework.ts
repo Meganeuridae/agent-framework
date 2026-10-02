@@ -99,10 +99,12 @@ import {
   type ParsedImagePlaceholder,
 } from './tool-image-ledger.js';
 import { randomUUID, createHash } from 'node:crypto';
-import { PyRunner, buildInjectedTools } from './code-execution/py-runner.js';
+import { PyRunner, buildInjectedTools, formatLimit } from './code-execution/py-runner.js';
 import {
   buildCodeExecutionToolDefinition,
   CODE_EXECUTION_TOOL_NAME,
+  scriptTimeLimits,
+  validateCodeExecutionConfig,
 } from './code-execution/tool-definition.js';
 import { splitProseSegments } from './prose-segments.js';
 import { cumulativeDelta } from './usage-accounting.js';
@@ -1432,6 +1434,9 @@ export class AgentFramework {
    * Create and start the framework.
    */
   static async create(config: FrameworkConfig): Promise<AgentFramework> {
+    // Before anything opens or starts: a refused config must leave nothing behind.
+    if (config.codeExecution?.enabled) validateCodeExecutionConfig(config.codeExecution);
+
     // Create or use existing store
     let store: JsStore;
     let ownsStore: boolean;
@@ -10732,6 +10737,7 @@ export class AgentFramework {
       background?: unknown;
       action?: unknown;
       script_id?: unknown;
+      time_limit_ms?: unknown;
     };
 
     // Management surface: the agent's own daemon fleet is inspectable and
@@ -10780,6 +10786,18 @@ export class AgentFramework {
       };
     }
 
+    // A per-call time limit, capped by the deployment's ceiling (the result says when it was capped).
+    if (input.time_limit_ms !== undefined && (typeof input.time_limit_ms !== 'number' || !Number.isFinite(input.time_limit_ms) || input.time_limit_ms < 1000)) {
+      return { success: false, error: '`time_limit_ms` must be a number of milliseconds, at least 1000', isError: true };
+    }
+    const limits = scriptTimeLimits(this.codeExecutionConfig ?? undefined);
+    const ceilingMs = input.background === true ? limits.backgroundMaxMs : limits.maxMs;
+    const requestedMs = input.time_limit_ms === undefined ? undefined : Math.floor(input.time_limit_ms);
+    const timeLimitMs = requestedMs === undefined ? undefined : Math.min(requestedMs, ceilingMs);
+    const capNote = requestedMs !== undefined && requestedMs > ceilingMs
+      ? `time_limit_ms ${requestedMs} was capped at ${ceilingMs}, this deployment's maximum`
+      : undefined;
+
     const agent = this.agents.get(agentName);
     const surface = agent
       ? this.getToolsForAgent(agentName).filter((t) => agent.canUseTool(t.name))
@@ -10789,17 +10807,26 @@ export class AgentFramework {
     );
 
     if (input.background === true) {
-      return this.startBackgroundScript(agentName, input.code, injected);
+      const started = this.startBackgroundScript(agentName, input.code, injected, timeLimitMs);
+      if (capNote && started.success && started.data && typeof started.data === 'object') {
+        (started.data as Record<string, unknown>).time_limit_note = capNote;
+      }
+      return started;
     }
 
     const runner = this.getOrCreateScriptRunner(agentName);
     this.scriptDeferredEndTurn.delete(agentName);
-    const exec = await runner.exec(input.code, injected);
+    const exec = await runner.exec(input.code, injected, undefined, timeLimitMs !== undefined ? { deadlineMs: timeLimitMs } : undefined);
     const endTurn = this.scriptDeferredEndTurn.delete(agentName);
 
     return {
       success: true,
-      data: { stdout: exec.stdout, stderr: exec.stderr, return_code: exec.returnCode },
+      data: {
+        stdout: exec.stdout,
+        stderr: exec.stderr,
+        return_code: exec.returnCode,
+        ...(capNote ? { time_limit_note: capNote } : {}),
+      },
       isError: false,
       ...(endTurn ? { endTurn: true } : {}),
     };
@@ -10821,6 +10848,7 @@ export class AgentFramework {
     agentName: string,
     code: string,
     injected: import('./code-execution/py-runner.js').InjectedTool[],
+    timeLimitMs?: number,
   ): ToolResult {
     // v1: primary-agent-only. A conversation fork's or ephemeral's daemon
     // would outlive its owner and its wake would land in the primary
@@ -10846,7 +10874,8 @@ export class AgentFramework {
     }
 
     const scriptId = `bg-${++this.backgroundScriptCounter}`;
-    const lifetimeMs = cfg?.backgroundMaxLifetimeMs ?? 86_400_000;
+    // The agent's time_limit_ms (already capped) shortens the lifetime; it never extends it.
+    const lifetimeMs = timeLimitMs ?? cfg?.backgroundMaxLifetimeMs ?? 86_400_000;
 
     // Journal: a file under the agent's first read-write workspace mount so
     // their existing read/grep/shell tools work on it. Python appends
@@ -10912,6 +10941,7 @@ export class AgentFramework {
         script_id: scriptId,
         log: logPath ?? 'no writable workspace mount — output is not retrievable; only wake_agent() reaches you',
         lifetime_hours: Math.round(lifetimeMs / 3_600_000 * 10) / 10,
+        lifetime: formatLimit(lifetimeMs), // exact for short limits, which lifetime_hours rounds to 0
         note: 'The script dies if the host process restarts. Manage with code_execution {"action": "list"|"cancel"}.',
       },
     };
