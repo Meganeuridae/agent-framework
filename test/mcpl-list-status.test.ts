@@ -48,6 +48,7 @@ test('listMcplServers exposes the live grant layers and host-owned authority', (
     maskedCapabilities: ['channels.streaming'],
     deniedCapabilities: ['contextHooks.beforeInference.inject.system'],
     allowHostCommands: true,
+    toolObserveFilter: null,
     manifestState: {
       lastValidatedRevision: 'sha256:validated',
       lastFetchedAt: 1_786_000_000_000,

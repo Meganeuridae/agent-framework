@@ -209,6 +209,21 @@ export type TraceEvent =
       messageId: string;
       source: string;
     })
+  /** An unread message withdrawn or replaced by its sender (RFC-006). */
+  | (TraceEventBase & {
+      type: 'message:removed';
+      messageId: string;
+      source: string;
+    })
+  /** RFC-006 coalescing decision record (received / displaced / removed /
+   *  rendered / revoked / render-cancelled / late-render / render-failed). */
+  | (TraceEventBase & {
+      type: 'mcpl:coalescing';
+      kind: string;
+      subject?: string;
+      eventId?: string;
+      [key: string]: unknown;
+    })
 
   // EventGate lifecycle
   | (TraceEventBase & {
@@ -264,6 +279,20 @@ export type TraceEvent =
       agentName: string;
       fromBranch: string;
       toBranch: string;
+    })
+
+  // Operator-initiated mutation (rollback/suppress/undo/hide/settings/quiesce…).
+  // Mirrors the durable operator-actions.jsonl record so live UIs see the
+  // same entry the file keeps.
+  | (TraceEventBase & {
+      type: 'operator:action';
+      agentName?: string;
+      kind: string;
+      requester?: { via: string; name?: string; id?: string };
+      note?: string;
+      params?: Record<string, unknown>;
+      result?: Record<string, unknown>;
+      error?: string;
     })
 
   // MCPL subprocess stderr (one trace per line, for receipts when things break)
@@ -426,6 +455,34 @@ export type TraceEvent =
       message: string;
       /** Kind-specific structured payload (mirrors the failures.log record). */
       data?: Record<string, unknown>;
+    })
+
+  // Host quiesce/maintenance mode (issue #122)
+  | (TraceEventBase & {
+      type: 'host:quiesce';
+      reason?: string;
+      /** Whether all turns settled within the drain window. */
+      drained: boolean;
+      /** Turns still alive at return (0 unless the drain timed out). */
+      activeTurns: number;
+      /** Wakes still parked on provider admission at return (see HostModeStatus). */
+      parkedAdmissions?: number;
+      /** True when undrained turns were force-cancelled (abandon). */
+      abandoned?: boolean;
+      /** Agents whose turn abandon could not cancel (token held, no stream). */
+      unabandonable?: string[];
+    })
+  | (TraceEventBase & {
+      type: 'host:resume';
+      /** True when a failing feasibility verdict was overridden. */
+      forced?: boolean;
+      /** Gated inference requests released back to the scheduler. */
+      releasedRequests: number;
+    })
+  | (TraceEventBase & {
+      type: 'host:quiesced_boot';
+      reason?: string;
+      since?: number;
     });
 
 /**

@@ -12,6 +12,239 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.19.0 — 2026-09-28
+
+### Added
+
+- `journal({content})` — a synthesized private note-taking tool beside `think`
+  and `skip_reply`. The entry stays in the agent's own context and is sent
+  nowhere; it does not end the turn and does not affect prose routing. It exists
+  because long prose kept in `skip_reply.reason` (or `think.content`) makes
+  replayed history read as a reasoning trace, and every memory-compression
+  request over it is refused `reasoning_extraction` regardless of content,
+  while the same prose in a note-taking tool passes. Context-manager's
+  `compressionToolProseFallback` rung rewrites old history into calls to this
+  tool and mirrors its result wording.
+
+### Changed
+
+- `classifyInferenceError` matches context-manager's `OverBudgetError` /
+  `UncoveredDropError` with a real cross-package `instanceof` now that CM
+  exports them from its package root (context-manager#41/#71 — the follow-up
+  promised there). The `err.name` comparison is kept as a fallback for
+  deployments carrying two CM copies, and the message-prose match remains a
+  last resort for serialized reasons; neither classification changes.
+
+- `skip_reply.reason` is now described as ONE short line (under ~100
+  characters), pointing at `journal()` for anything longer. Description only —
+  no length is enforced and existing calls behave exactly as before.
+
+### Fixed
+
+- `channels/changed` is answered before the host reconciles the added
+  channels, as `channels/register` already was (#160). Reconciling sends
+  `channels/open` or `channels/close` back to the server, and a server that
+  announced from inside a request it was serving (a tool that refreshes or
+  subscribes) could not read them until its announcement was answered, so
+  both sides waited until one timed out. In zulip-mcp this left streams the
+  bot joined after startup as `Unknown channel` until a restart.
+
+## 0.18.0 — 2026-09-25
+
+### Changed
+
+- Depend on `@animalabs/context-manager` `^0.11.0`: the kv-unified solver no longer
+  grows its label set with the forest once a cache is relevant (#105), solves are
+  packed and selectively rescored (#110), and signed thinking blocks are priced by
+  signature (#113, the store-side half of #170).
+
+### Fixed
+
+- Signed `thinking` / `redacted_thinking` blocks are stamped with a `tokenEstimate` when persisted: this call's `usage.output_tokens` minus the visible blocks, split across carriers by signature length (per tool round, and on the trailing content at completion; cumulative membrane usage is diffed per call). On keep-all models the hidden chain of thought is replayed and billed as input on every later call, and context-manager's budget had no measure of it beyond a flat default — the compiled request ran ~1.5× over budget on long agentic histories, with dead `max_tokens` turns at the context ceiling.
+
+## 0.17.0 — 2026-09-21
+
+### Added
+
+- `FrameworkConfig.providerHold(error, agentName)`: a host hook consulted on
+  a failed inference, before the error policy. Returning `{ holdMs, reason }`
+  parks the agent's provider admission the same way the built-in
+  organization-acceleration cooldown does — no immediate retry, no
+  `[inference-failed]` marker, no hard-down streak, arrivals held and merged
+  into one later compile. Holds are served in slices of at most 10 minutes;
+  when a slice expires the hook is asked again before any inference is
+  attempted, so a long wait (a spent subscription quota window) costs no
+  provider calls and an early reset is noticed within one slice.
+  The hook is asked before the built-in acceleration classification, and
+  receives `{ model }` for the failing agent. A failure in an auxiliary
+  (compression) call arms the hold too, and such a hold releases without
+  synthesising an inference. Ephemeral runs and conversation forks are not
+  covered. `healthSnapshot()` reports `cooldownReason` and `hostHold`.
+
+## 0.16.0 — 2026-09-18
+
+### Added
+
+- Host quiesce/maintenance mode (#122): `framework.quiesce()` drains
+  in-flight turns (bounded, optional `abandon`), parks every subsequent wake
+  (coalesced per agent+reason), pauses all MCPL data planes (control planes
+  stay live), defers module/API context writes, and persists `hostMode` so a
+  restart boots quiesced with a loud banner. `framework.resume()` gates on a
+  fresh per-agent feasibility preview of the CURRENT settings (`force` to
+  override; `ResumeBlockedError` carries per-agent verdicts), reopens data
+  planes through the existing barrier funnel, flushes deferred writes and
+  releases parked wakes. `framework.maintenanceTick()` runs one
+  compression/maintenance pass on demand. Surfaces: `host/command` verbs
+  `quiesce` / `resume` / `maintain` / `host-status`; WS `host.quiesce` /
+  `host.resume` / `host.status` / `host.maintenanceTick`; HTTP `GET /hostmode`,
+  `POST /quiesce|/resume|/maintenance/tick` (opt-in `ApiServerConfig.adminToken`,
+  `x-admin-token` header always required on the POST verbs to force a CORS
+  preflight). New traces `host:quiesce`, `host:resume`, `host:quiesced_boot`.
+- Runtime-settings feasibility preview: `framework.previewAgentRuntimeSettings()`
+  and `Agent.planRuntimeSettings()` expose the live→effective budget mapping;
+  `updateAgentRuntimeSettings` preflights an immediate budget LOWERING and
+  throws `BudgetPreflightError` when the folded floor cannot fit (paced
+  descents, increases, no-op rewrites and boot restore are never blocked;
+  `allowInfeasible` overrides).
+- Review hardening of the above: `resume()` flushes deferred writes per
+  message (a poison write cannot drop the rest or skip the data-plane
+  reopen, which now runs in a `finally`); writes deferred while quiesced are
+  persisted (`framework/deferred-writes` slot) and restored at a quiesced
+  boot (`HostModeStatus.deferredWrites`); parked wakes coalesce per
+  (reason, addressed) so a DM/mention parked earlier survives ambient
+  traffic parked later; the `[1s, 10m]` drain clamp lives in `quiesce()` for
+  every ingress; a `quiesce()` superseded by a concurrent `resume()` returns
+  without abandoning anything; `resume()` waits for an in-flight maintenance
+  pass instead of skipping the feasibility verdict; `abandon` reports turns
+  it cannot cancel (`unabandonable`); `tool_results_ready` continuations pass
+  the wake gate like budget restarts; `maintenanceTick()` returns `ran`;
+  `nudge`/`unstick` replies carry `quiesced: true` while parked. ApiServer:
+  WebSocket upgrades from foreign browser origins are refused
+  (`ApiServerConfig.allowedOrigins`; same-host and non-browser clients pass),
+  an empty `adminToken` is rejected at construction, `GET /hostmode` requires
+  the token when one is configured, and `host-command` on the MCPL control
+  plane means a surface `/undo` can now run ahead of pushes still buffered
+  behind a startup/reconnect barrier.
+- Review round 2: quiesce state and the deferred-write queue now live OUTSIDE
+  branch history — `<storePath>/recovery/host-mode.json` and
+  `recovery/deferred-writes.json` (`FrameworkConfig.hostModePath` /
+  `deferredWritesPath`; the branch-local slot is only a fallback for
+  store-only configs, with a warning) — so a historical rollback can no
+  longer erase the marker of the surgery it belongs to or orphan the writes
+  it deferred. A wake parked on provider admission behind an in-flight
+  auxiliary call now rechecks quiesce when the auxiliary settles and is
+  requeued instead of starting a turn; `HostModeStatus.parkedAdmissions`
+  counts such wakes and `drained` is false while any exist. The resume flush
+  acknowledges each deferred write durably as it lands and stamps its id into
+  the stored message's metadata; boot recovers the queue regardless of the
+  mode flag, skips ids that already landed, and the durable flag is cleared
+  only after the flush completes — an interrupted resume neither loses nor
+  duplicates a message.
+- Review round 3: a flushed deferred write is removed from the durable
+  recovery queue only AFTER `store.sync()` has made the appended chronicle
+  slots durable (chronicle persists the slot-chain head on sync, not on
+  append). Every deferred-drain path — resume flush, boot recovery, the
+  turn-start / turn-end / puppet-end flushes — hands its batch to an
+  un-acked set, writes, syncs, and only then rewrites the queue; a failed
+  sync keeps the batch queued (retried at the next ack and at `stop()`).
+  Regression coverage uses a real child process that `process.exit`s
+  mid-resume, both right after the first acknowledgement and before the
+  sync: the reopened host replays exactly the un-landed remainder.
+- Review round 4: one durable id per logical deferred write across every
+  hand-off. Every write that originates from the durable queue — the
+  ordinary turn-start, mid-turn-injection, turn-end and puppet-end flushes,
+  not only the resume flush — stamps `metadata.deferredWriteId`, and a
+  re-deferral (target still busy or host still quiesced when a drained entry
+  is written) moves the same entry back to pending under the same id
+  instead of minting a second replayable one. Two more real child-process
+  crash regressions: exit between an ordinary turn-start flush's sync and
+  its queue rewrite, and exit at a re-deferral's recovery-file write.
+- Review round 5: deferred-write entries carry a monotonic `seq` from first
+  deferral; the durable queue is written, restored, drained and flushed in
+  that order whatever the pending/un-acked split, so a re-deferred member
+  of a batch keeps its place. Each hand-off persists a receipt of the
+  target's store position before anything is written; boot dedup scans from
+  that position to the tail (the whole store when a receipt predates it),
+  never a fixed 2,000-message tail — a synced-but-unacked batch of any size
+  is recognised in full. Recovery file/slot format is v2
+  (`{pending, scanFrom}`); v1 is still read.
+
+- `HistoryModule` gains a fourth tool, `overview`, for browsing conversation
+  history when the caller doesn't already know a specific channel/date/search
+  term: returns existing compression summaries as a table of contents (zero
+  new LLM calls), falling back to raw message/channel counts for spans not
+  yet summarized. `stats`/`extract`/`search`/`overview` now all accept a
+  `channelId` as either a channel label (e.g. `#general`, `@name`, `<@id>`)
+  or the raw internal channel id — resolved via a new durable
+  `ChannelRegistry` label-history log, so a channel is still addressable by
+  name even after the bot disconnects from it (the common case for browsing
+  history on a quiet/old channel, where the live channel registry has
+  nothing).
+
+- Live operator surgery on the open store, no restart: `rollbackToMessage()`
+  forks the chronicle at a message and switches to the fork (the source
+  branch keeps everything after it); `suppressMessages()` forks at head,
+  redacts the chosen messages on the fork (body-group shards always
+  together), and switches. Both are the offline-recovery idiom made live and
+  reuse the Discord awareness outbox (markers for messages that left the
+  context; suppression batches activate only after the last redaction and
+  finish at next boot if interrupted). Both refuse — never queue — while the
+  agent is not idle (`OperatorActionError`, code `agent-busy`). The
+  message-granular `host/command undo` now rides on `rollbackToMessage`
+  (reads windowed, blob-free — no longer re-inflates every attachment on the
+  branch). Its stderr line is now `[operator] rollback …` rather than
+  `[host-command] undo-messages …`, and the reply carries the refusal `code`.
+  Body groups are never bisected: a rollback target inside a sharded message
+  snaps to the group's last shard (`tailMessageId` in the result), and a
+  suppression removes the whole group as a range. The idle gate is the
+  scheduler's own (`idle+turn-alive` counts as busy).
+- `DiscordAwarenessOutbox.discard(batchId)` retires a prepared-but-never-
+  activated batch. Live suppression uses it on every failure path so an
+  orphaned explicit batch can no longer re-arm at boot and abort
+  `AgentFramework.create()`.
+- Durable operator log: `<storePath>/operator-actions.jsonl` (config
+  `operatorLogPath`, `false` to disable) records who asked, from where, and
+  why for every operator mutation — rollback, suppress, hide, undo/redo turn,
+  unstick, nudge, runtime-settings update/reset/cancel — plus anything a host
+  records through `recordOperatorAction()` (e.g. quiesce/resume). Each record
+  is also broadcast as an `operator:action` trace; `getOperatorLog()` reads
+  the tail. `undoLastTurn`/`redo`/settings methods accept an optional
+  requester.
+
+## 0.15.0 — 2026-09-17
+
+### Added
+
+- `HistoryModule` adds `stats`/`extract`/`search` tools for querying an
+  agent's full uncompressed message history by time range and/or channel
+  (#151), backed by context-manager's native chronicle secondary-index
+  queries — O(log n + k) against multi-million-message stores, not a full
+  scan. Read-only, `bind(contextManager)` after `AgentFramework.create()`.
+
+### Fixed
+
+- `puppetToolCall` reserves the agent against turn start for its whole
+  duration (#145). The idle check was a point in time before two awaits
+  (tool execution, result build); a wake arriving in either gap started a
+  real turn, and the synthetic `tool_use`/`tool_result` pair then wrote
+  straight into the window under that turn — the wire-order corruption the
+  puppet exists to avoid. The puppet now holds the turn-alive marker the
+  scheduler and the `addMessage` deferral guard already respect, and refuses
+  when a turn is alive even if status reads idle. The one path that could
+  still start a turn over the reservation — a wake parked on provider
+  admission resuming after an auxiliary call — now re-tests turn-alive, gives
+  admission back and requeues the wake for the scheduler instead.
+
+- kv-unified: a new activation now closes any receipt flight its predecessor left unsettled before it submits its own. A provider attempt that died without a usage event (transport error, idle timeout, budget-restart or endTurn cancel) used to keep its flight open until the old stream's teardown, and every successor path started first — so the retry itself failed with `kv-unified submission … is still in flight` (devops agent, 2026-09-16).
+- Inference-log records below the blob threshold are persisted through their JSON view; the kv-unified receipt hook on a compiled request (a function) made Chronicle reject the record with `JS functions cannot be represented as a serde_json::Value`, throwing from the failure path it was logging.
+
+- Oversized tool-result spill files can now be read in bounded character
+  ranges with `workspace--read` (`offsetChars`/`limitChars`). Spill notices
+  include a read command sized for the inline cap and explain how to continue.
+  This makes single-line JSON, large string values, and non-JSON long lines
+  recoverable without rewriting the stored result or expanding it past the
+  workspace file-size limit. Existing line-based reads keep their behavior.
+
 ## 0.14.0 — 2026-09-09
 
 ### Added

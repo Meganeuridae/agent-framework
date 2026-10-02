@@ -2,7 +2,8 @@
 export * from './types/index.js';
 
 // Core classes
-export { AgentFramework } from './framework.js';
+export { AgentFramework, BudgetPreflightError, ResumeBlockedError } from './framework.js';
+export type { RuntimeSettingsPreview, HostModeStatus } from './framework.js';
 export { Agent } from './agent.js';
 export type { StartStreamResult } from './agent.js';
 export { ProcessQueueImpl } from './queue.js';
@@ -92,6 +93,18 @@ export type { McplServerConfig } from './mcpl/index.js';
 export { McplServerConnection } from './mcpl/index.js';
 export type { McplHostCapabilities } from './mcpl/index.js';
 
+// MCPL tool lifecycle (RFC-007) and tool classes (RFC-008): the types a host
+// needs to write McplServerConfig.toolLifecycle policy and class tables, and
+// the portable pattern matcher both use.
+export { TOOL_CLASSES, DEFAULT_INPUT_CLASSES, globMatch } from './mcpl/index.js';
+export type {
+  ToolClass,
+  ToolLifecycleConfig,
+  ToolLifecycleNarrowing,
+  ToolLifecycleParams,
+  ToolObserveRule,
+} from './mcpl/index.js';
+
 // Per-channel conversation routing
 export { ConversationRouter, DEFAULT_CLOSURE_PROMPT } from './mcpl/index.js';
 export type {
@@ -124,6 +137,9 @@ export type {
   DiscordAwarenessRef,
   DiscordSuppressionInterval,
 } from './recovery/discord-awareness-outbox.js';
+// Live operator surgery (rollback / suppress) and its durable action log
+export { OperatorLog, OperatorActionError, defaultOperatorLogPath } from './operator-log.js';
+export type { OperatorLogEntry, OperatorLogInput, OperatorRequester } from './operator-log.js';
 export { createOfflineRecoveryBranch } from './recovery/offline-branch.js';
 export type {
   OfflineRecoveryBranchOptions,

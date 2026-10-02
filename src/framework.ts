@@ -1,12 +1,12 @@
+import { dirname, join } from 'node:path';
 import { ScriptRun, type TimeoutPolicy } from './code-execution/script-run.js';
-import { join } from 'node:path';
 import { INLINE_WITHHELD_TEXT, classifyBlock, isInlineContradiction, referenceRegistry, referenceStubOrNull } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
-import { appendFileSync, mkdirSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
-import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy } from '@animalabs/context-manager';
+import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
@@ -22,6 +22,7 @@ import type {
   FrameworkConfig,
   InferencePolicy,
   ErrorPolicy,
+  ProviderHoldHook,
   ErrorAction,
   FrameworkState,
   TraceEvent,
@@ -67,7 +68,15 @@ import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
 import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
-import { PushHandler, type McplPushEvent } from './mcpl/push-handler.js';
+import { ToolLifecycleEmitter, parseToolObserveParams } from './mcpl/tool-lifecycle.js';
+import { BUILTIN_TOOL_CLASSES, normalizeClassTable, parseDeclaredClasses, resolveToolClass, type ToolClass } from './mcpl/tool-classes.js';
+import { PushHandler, convertBlock as convertPushBlock, type McplPushEvent } from './mcpl/push-handler.js';
+import {
+  PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, validateCoalesceMember, validateCoalescedContent,
+  coalescingSubjectKey, type CoalescedOccurrence, type CoalescingPlacement, type CoalescingSnapshot,
+  type CoalescingReceiptRecord,
+} from './mcpl/push-coalescer.js';
+import type { ChannelIncomingMessage, ChannelIncomingMessageResult, McplContentBlock, PushEventResult } from './mcpl/types.js';
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
@@ -90,14 +99,17 @@ import {
   splitPreservingImageSlots,
   type ParsedImagePlaceholder,
 } from './tool-image-ledger.js';
-import { randomUUID } from 'node:crypto';
-import { PyRunner, buildInjectedTools } from './code-execution/py-runner.js';
+import { randomUUID, createHash } from 'node:crypto';
+import { PyRunner, buildInjectedTools, formatLimit } from './code-execution/py-runner.js';
 import {
   buildCodeExecutionToolDefinition,
   CODE_EXECUTION_TOOL_NAME,
+  scriptTimeLimits,
+  validateCodeExecutionConfig,
 } from './code-execution/tool-definition.js';
 import { splitProseSegments } from './prose-segments.js';
 import { cumulativeDelta } from './usage-accounting.js';
+import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 
 /** Detect a supported image media type from magic bytes (the model API
  *  rejects mislabeled media types, so trust bytes over extensions).
@@ -395,8 +407,79 @@ import {
   defaultDiscordAwarenessOutboxPath,
   extractDiscordAwarenessRefs,
 } from './recovery/discord-awareness-outbox.js';
+import {
+  OperatorActionError,
+  OperatorLog,
+  capIds,
+  defaultOperatorLogPath,
+  type OperatorLogEntry,
+  type OperatorLogInput,
+  type OperatorRequester,
+} from './operator-log.js';
 
 const FRAMEWORK_STATE_ID = 'framework/state';
+/** Snapshot slot mirroring context writes deferred while quiesced (#122). */
+const DEFERRED_WRITES_ID = 'framework/deferred-writes';
+/** The event a coalesced occurrence delivers through — one per lane. */
+interface CoalescedChannelEvent {
+  type: 'mcpl:channel-incoming';
+  serverId: string;
+  channelId: string;
+  messageId: string;
+  threadId?: string;
+  author: { id: string; name: string };
+  content: ContentBlock[];
+  timestamp: string;
+  metadata?: Record<string, unknown>;
+  tags?: string[];
+  triggerInference?: boolean;
+  targetAgents?: string[];
+  coalescingSubject?: string;
+  /** Occurrence id (RFC-006 §3.1); channel messages carry it only when coalesced. */
+  eventId?: string;
+  /** RFC-006 assembly: materialized for this agent's turn (store directly). */
+  assemblingFor?: string;
+  /** RFC-006 §3.2: deliver into this agent only (replacement / notice audience). */
+  deliverTo?: string;
+}
+type CoalescedDelivery =
+  | { lane: 'channel'; event: CoalescedChannelEvent }
+  | { lane: 'push'; event: McplPushEvent };
+/** RFC-006 coalescing bookkeeping: receipts (retry window) + subject history. */
+const COALESCING_STATE_ID = 'mcpl/coalescing';
+/** Receipts written since the last snapshot flush (bridges the throttle window). */
+const COALESCING_RECENT_ID = 'mcpl/coalescing-recent';
+/** Above this serialized size the deferred-write mirror is skipped (kept in
+ *  memory only) rather than rewriting a multi-MB snapshot per deferral. */
+const DEFERRED_WRITES_PERSIST_CAP_BYTES = 4 * 1024 * 1024;
+
+/** Requests that CONTINUE a turn whose token is already held — a context-
+ *  budget restart, or the non-streaming path's tool-results round. The
+ *  quiesce wake gate lets these through: the drain is exactly the phase
+ *  where such a turn must be allowed to finish, and parking them would hold
+ *  the token until the drain timed out (and `abandon` could not clear a turn
+ *  with no stream). */
+/** One entry of the deferred-write queue (see AgentFramework.deferredMessages). */
+interface DeferredWrite {
+  id: string;
+  seq: number;
+  participant: string;
+  content: ContentBlock[];
+  metadata?: MessageMetadata;
+  forAgent?: string;
+}
+const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
+
+/** Stamp a deferred write's durable id into the metadata it is stored with
+ *  (boot recovery dedups replays by it). Idempotent for an already-stamped
+ *  message. */
+function withDeferredWriteId(metadata: MessageMetadata | undefined, id: string): MessageMetadata {
+  return { ...(metadata ?? {}), deferredWriteId: id } as MessageMetadata;
+}
+
+function isTurnContinuation(reason: string): boolean {
+  return reason === 'context_budget_restart' || reason === 'tool_results_ready';
+}
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
@@ -445,6 +528,106 @@ class DiscordAwarenessAccountingError extends Error {
   }
 }
 
+/**
+ * Feasibility verdict for a runtime-settings patch, derived through the SAME
+ * settings→config mapping the live apply path uses (`Agent.planRuntimeSettings`
+ * → `previewContextSettings`). The `effective` verdict is for the budget the
+ * next compile actually plans at — for a paced descent that is the UNCHANGED
+ * live budget, with the descent target reported separately as `advisory`.
+ */
+export interface RuntimeSettingsPreview {
+  /** False when no verdict could be computed (no strategy support, preview
+   * overlap, stale branch generation, …) — see `reason`. Never silently
+   * swallowed: an unavailable preview is an answer, not an error. */
+  available: boolean;
+  reason?:
+    | 'no_preview_support'
+    | 'preview_in_flight'
+    | 'branch_generation_changed'
+    | 'no_adaptive_resolution'
+    | string;
+  path: 'immediate' | 'paced' | 'none';
+  /** The budget compiles currently plan at (baseline of the patch). */
+  liveBudgetTokens: number;
+  /** Verdict at the effective compile budget (spread of the strategy's
+   * PreviewResult: finalTokens, fits, headTokens, tailTokens, middleTokens,
+   * deepestLevel, exhausted, …). */
+  effective?: { budgetTokens: number; fits: boolean; finalTokens: number } & Record<string, unknown>;
+  /** Best-effort verdict at a paced-descent target. Advisory only — a target
+   * below the folded floor does not block the patch; the descent simply
+   * converges as far as the floor allows. */
+  advisory?: { targetTokens: number; fits: boolean } & Record<string, unknown>;
+  transition: 'stable' | 'converging' | 'blocked';
+  transitionReason?: string;
+}
+
+/**
+ * Thrown by `updateAgentRuntimeSettings` when an immediate budget change would
+ * put the agent in an un-compilable layout: the folded floor renders more
+ * tokens than the hard budget admits, so every subsequent compile would
+ * OverBudget-wedge the agent (2026-08-21: mythos, 550k→260k set live against a
+ * ~450k floor — hours of hard-down). Overridable with `{ allowInfeasible: true }`.
+ * Paced descents never throw this: a non-immediate decrease leaves the compile
+ * budget untouched and converges only as far as the floor allows.
+ */
+export class BudgetPreflightError extends Error {
+  constructor(
+    message: string,
+    readonly preview: RuntimeSettingsPreview,
+  ) {
+    super(message);
+    this.name = 'BudgetPreflightError';
+  }
+}
+
+/** Operator-facing snapshot of the host's quiesce state (issue #122). */
+export interface HostModeStatus {
+  quiesced: boolean;
+  reason?: string;
+  since?: number;
+  /** True when no turn is alive (activeTurnTokens empty — the token spans
+   * dequeue → settled teardown, strictly wider than activeStreams). */
+  drained: boolean;
+  activeTurns: number;
+  /** Wakes that own provider admission while waiting for an in-flight
+   * auxiliary call — no turn token yet, but a turn is one settle away. The
+   * admission continuation rechecks quiesce and requeues them; `drained`
+   * is false until it has. */
+  parkedAdmissions: number;
+  /** Inference requests parked by the quiesce wake gate (while quiesced), or
+   * simply queued (while serving — non-zero right after a resume until the
+   * scheduler's next pass consumes them). Continuations of a held turn
+   * (budget restart, tool results) are never counted. */
+  gatedRequests: number;
+  /** Background code-execution scripts still running. Quiesce does NOT stop
+   * them — they hold no turn token, so drain doesn't wait for them. Reported
+   * so the operator sees what is still acting during the window. */
+  backgroundScripts: number;
+  /** Context writes (module events, api message.send) withheld because the
+   * host is quiesced. Persisted while quiesced and flushed by resume(). */
+  deferredWrites: number;
+  /** Agents whose turn `abandon` could NOT cancel: the turn token is held but
+   * no stream exists yet (still in hooks/compile) or ever will (puppet tool
+   * turns). Present only after an abandon that left such turns behind. */
+  unabandonable?: string[];
+}
+
+/**
+ * Thrown by `resume()` when the current runtime settings do not compile for
+ * one or more agents — returning to service would OverBudget-wedge them on
+ * the first wake. Drain quarantine / advance merges to lower the floor, or
+ * pass `{ force: true }` after deciding the verdicts are acceptable.
+ */
+export class ResumeBlockedError extends Error {
+  constructor(
+    message: string,
+    readonly verdicts: Array<{ agentName: string; preview: RuntimeSettingsPreview }>,
+  ) {
+    super(message);
+    this.name = 'ResumeBlockedError';
+  }
+}
+
 interface RedoEntry {
   branchName: string;
   checkpoint: TurnCheckpoint;
@@ -465,6 +648,85 @@ class DefaultInferencePolicy implements InferencePolicy {
   ): boolean {
     return requests.some((r) => r.agentName === agentName);
   }
+}
+
+/** Minimal read surface the live-surgery helpers need from a ContextManager. */
+interface SurgeryReadableCm {
+  getMessageCount(): number;
+  getMessageWindow(
+    offset: number,
+    limit: number,
+    opts?: { resolveBlobs?: boolean; alignToBodyGroups?: boolean },
+  ): { messages: Array<{ id: unknown; bodyGroupId?: string }>; startIndex: number };
+}
+
+const SURGERY_SCAN_WINDOW = 500;
+
+/**
+ * Slot index of `messageId` on the active branch, or -1. Scans from the tail
+ * in blob-free windows: operator targets are almost always recent, and a
+ * full `getAllMessages()` re-inflates every attachment on the branch.
+ */
+function locateMessageIndex(cm: SurgeryReadableCm, messageId: string): number {
+  const hit = locateMessageIndices(cm, new Set([messageId])).get(messageId);
+  return hit ? hit.index : -1;
+}
+
+/** Tail-first scan resolving many ids at once; stops as soon as all are found. */
+function locateMessageIndices(
+  cm: SurgeryReadableCm,
+  ids: Set<string>,
+): Map<string, { index: number; bodyGroupId?: string }> {
+  const found = new Map<string, { index: number; bodyGroupId?: string }>();
+  const total = cm.getMessageCount();
+  for (let end = total; end > 0 && found.size < ids.size; end -= SURGERY_SCAN_WINDOW) {
+    const start = Math.max(0, end - SURGERY_SCAN_WINDOW);
+    const { messages, startIndex } = cm.getMessageWindow(start, end - start, { resolveBlobs: false });
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const id = String(messages[i].id);
+      if (ids.has(id) && !found.has(id)) {
+        found.set(id, {
+          index: startIndex + i,
+          ...(messages[i].bodyGroupId ? { bodyGroupId: messages[i].bodyGroupId } : {}),
+        });
+      }
+    }
+  }
+  return found;
+}
+
+/**
+ * Inclusive slot range of the body-group run containing `index` (the slot
+ * itself when it is not sharded). Delegates to the store's own
+ * `alignToBodyGroups` edge walk — one contiguity assumption, not two.
+ */
+function bodyGroupRun(
+  cm: SurgeryReadableCm,
+  index: number,
+): { from: number; to: number; fromId: string; toId: string; group: boolean } {
+  const win = cm.getMessageWindow(index, 1, { alignToBodyGroups: true, resolveBlobs: false });
+  const from = win.startIndex;
+  const to = win.startIndex + win.messages.length - 1;
+  return {
+    from,
+    to,
+    fromId: String(win.messages[0].id),
+    toId: String(win.messages[win.messages.length - 1].id),
+    group: win.messages[0].bodyGroupId !== undefined,
+  };
+}
+
+function describeRequester(r: OperatorRequester | undefined): string {
+  if (!r) return 'unknown';
+  return `${r.name ?? r.id ?? 'unknown'} (${r.via})`;
+}
+
+function hostCommandRequester(serverId: string, params: HostCommandParams): OperatorRequester {
+  return {
+    via: `host-command:${serverId}`,
+    ...(params.requesterName ? { name: params.requesterName } : {}),
+    ...(params.requesterId ? { id: params.requesterId } : {}),
+  };
 }
 
 function isPermanentDiscordReactionFailure(message: string): boolean {
@@ -524,6 +786,12 @@ interface ProviderAccelerationCooldown {
   heldRequests: InferenceRequest[];
   reason: string;
   failures: number;
+  /** Set on a host-requested hold (config.providerHold): the error to
+   *  re-present to the hook when this slice expires. */
+  hostHoldError?: Error;
+  /** Armed by an auxiliary (compression) failure with no primary involved:
+   *  release reopens auxiliary admission without synthesising an inference. */
+  auxiliaryOrigin?: boolean;
 }
 interface ProviderAccelerationRecovery {
   startedAt: number;
@@ -615,6 +883,14 @@ interface HostCommandParams {
   maxRewinds?: number;
   /** For the `unstick` command: raw channel id to post the outcome report to. */
   channelId?: string;
+  /** For the `quiesce` command: operator-facing reason recorded in the mode. */
+  reason?: string;
+  /** For the `quiesce` command: drain window in ms (clamped to [1s, 10m]). */
+  timeoutMs?: number;
+  /** For the `quiesce` command: cancel undrained turns after the window. */
+  abandon?: boolean;
+  /** For the `resume` command: override a failing feasibility verdict. */
+  force?: boolean;
   requesterId?: string;
   requesterName?: string;
 }
@@ -643,6 +919,7 @@ interface Deferred<T> {
  *  runEphemeralToCompletion — so the pieces cannot desync. */
 /** A Python execution, independent of the tool call currently observing it. */
 interface CodeExecutionRecord {
+  timeLimitNote?: string;
   id: string;
   mode: 'foreground' | 'background';
   run: ScriptRun;
@@ -699,6 +976,17 @@ export class AgentFramework {
   private activeTriggerChannels: Map<string, string> = new Map();
   private running = false;
   private loopPromise: Promise<void> | null = null;
+  /** Quiesce/maintenance mode (issue #122). DELIBERATELY separate from
+   * `running`, which is overloaded as the runLoop condition, the maintenance
+   * admission guard, AND the per-tick loop condition — expressing "paused" by
+   * clearing `running` would kill the very maintenance machinery quiesce
+   * exists to keep hot, plus store sync and tool-result processing. While
+   * quiesced: runLoop, syncTimer, maintenanceTimer, and the watchdog all keep
+   * running; only new turns (wake gate in processInferenceRequests) and MCPL
+   * data planes are held. */
+  private quiesced = false;
+  private quiesceReason?: string;
+  private quiescedAt?: number;
   private traceListeners: TraceEventListener[] = [];
   private syncIntervalMs: number;
   private syncTimer: ReturnType<typeof setInterval> | null = null;
@@ -714,6 +1002,7 @@ export class AgentFramework {
   private providerAccelerationLastRecovery: Map<string, ProviderAccelerationReceipt> = new Map();
   private providerAccelerationDefaultCooldownMs = PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS;
   private providerAccelerationJitterMs = PROVIDER_ACCELERATION_JITTER_MS;
+  private providerHoldHook: ProviderHoldHook | undefined;
   private providerAdmissionClosed = false;
   /** Last time we reported stale (busy-requeued) inference requests, per agent. */
   private staleWarnAt = new Map<string, number>();
@@ -803,7 +1092,7 @@ export class AgentFramework {
    *  `inference:exhausted` (which also pollutes the failure streak). Kept
    *  separate from ephemeralRuns deliberately: endTurn/budget cancels happen
    *  for resident agents too, and the key is per-stream, not per-agent. */
-  private frameworkCancelledStreams: Map<string, 'turn_ended' | 'budget_restart'> = new Map();
+  private frameworkCancelledStreams: Map<string, 'turn_ended' | 'budget_restart' | 'quiesce_abandoned'> = new Map();
   /** Active runEphemeralToCompletion runs, keyed by agent name. */
   private ephemeralRuns: Map<string, EphemeralRun> = new Map();
   /** Ephemeral namespaces/names are single-generation for this framework
@@ -878,7 +1167,42 @@ export class AgentFramework {
   /** Tune-out coordinator (issue #77); non-null iff subconscious + channels. */
   private tuneOutCoordinator: TuneOutCoordinator | null = null;
 
+  /** Agents an abandon could not cancel (token held, no stream) — surfaced
+   *  in HostModeStatus until the next quiesce/resume. */
+  private lastUnabandonable: string[] = [];
+  /** True while the deferred-write queue has a persisted mirror (quiesced). */
+  private deferredWritesPersisted = false;
+  private deferredWritesCapWarned = false;
+  /** Branch-independent recovery files (see FrameworkConfig.hostModePath /
+   *  deferredWritesPath). Undefined → branch-local slot fallback. */
+  private hostModePath: string | undefined;
+  private deferredWritesPath: string | undefined;
+  private recoveryFallbackWarned = false;
+  /**
+   * Deferred writes that have been handed to a context manager but whose
+   * chronicle state is NOT yet durably synced. They stay in the durable
+   * recovery queue until `ackDeferredWrites()` syncs the store — chronicle
+   * persists the slot-chain head only on sync(), so acknowledging on append
+   * alone would let a hard exit forget an accepted message.
+   */
+  private unackedDeferredWrites: DeferredWrite[] = [];
+  /** Monotonic order stamp for deferred writes: the durable queue is always
+   *  written, restored, drained and flushed in `seq` order, whatever the
+   *  pending/un-acked split — a re-deferred entry keeps its place. */
+  private deferredSeq = 0;
+  /**
+   * Per target agent: the store's message count when the OLDEST currently
+   * un-acked entry for it was handed off. Persisted with the queue so a boot
+   * after an interrupted flush knows exactly which slot range the batch
+   * could occupy and dedups against all of it — never a fixed tail.
+   */
+  private deferredScanFrom = new Map<string, number>();
   private deferredMessages: Array<{
+    /** Durable identity for per-message flush acknowledgement: a flush
+     *  interrupted by a crash replays only the messages not yet acked. */
+    id: string;
+    /** Order stamp (see deferredSeq). */
+    seq: number;
     participant: string;
     content: ContentBlock[];
     metadata?: MessageMetadata;
@@ -934,7 +1258,36 @@ export class AgentFramework {
   private mcplServerRegistry: McplServerRegistry | null = null;
   private featureSetManager: FeatureSetManager | null = null;
   private hookOrchestrator: HookOrchestrator | null = null;
+  /** MCPL RFC-007: `tools/lifecycle` to observing servers. Created with the
+   *  MCPL subsystem; inert (no tracking) while no connection holds
+   *  `toolLifecycle.observe`. */
+  private toolLifecycleEmitter: ToolLifecycleEmitter | null = null;
+  /** MCPL RFC-008 class sources, normalized: operator overrides, then host
+   *  knowledge (embedding host's table ahead of the built-in one). */
+  private toolClassOverrides: Array<[string, ToolClass[]]> = [];
+  private hostToolClasses: Array<[string, ToolClass[]]> = normalizeClassTable(
+    BUILTIN_TOOL_CLASSES as Record<string, readonly string[]>,
+    'BUILTIN_TOOL_CLASSES',
+  );
   private pushHandler: PushHandler | null = null;
+  /** RFC-006 coalescing (see mcpl/push-coalescer.ts for the design). */
+  private pushCoalescer: PushCoalescer<CoalescedDelivery> | null = null;
+  /** Both lanes are admitted in arrival order: a create, edit and delete of
+   *  one subject must not overtake one another while routing awaits. */
+  private coalescingAdmission: Promise<unknown> = Promise.resolve();
+  private coalescingSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  private coalescingSnapshotDirty: (() => CoalescingSnapshot) | null = null;
+  private coalescingRecentReceipts: CoalescingReceiptRecord[] = [];
+  /**
+   * Agents that read the residents' shared un-namespaced message slot: every
+   * ordinary resident (their context managers are not isolated) and the
+   * subconscious (isolated, but merging that slot read-only). A message in
+   * that slot is unread only if NONE of them has compiled past it. Forks and
+   * ephemeral agents have isolated slots and are their own only readers.
+   */
+  private readonly sharedSlotAgents = new Set<Agent>();
+  /** Group commit: one fsync per event-loop turn, shared by every waiter. */
+  private coalescingCommit: Promise<void> | null = null;
   private inferenceRouter: InferenceRouter | null = null;
   private channelRegistry: ChannelRegistry | null = null;
   private checkpointManager: CheckpointManager | null = null;
@@ -983,6 +1336,8 @@ export class AgentFramework {
   private mcplTools: import('./types/index.js').ToolDefinition[] = [];
   /** Namespaced tool name → stateful feature-set attribution from tools/list. */
   private mcplToolFeatureSets: Map<string, string> = new Map();
+  /** Namespaced tool name → the server's RFC-008 `_meta["mcpl/class"]`. */
+  private mcplToolClasses: Map<string, ToolClass[]> = new Map();
   private mcplToolRefreshInFlight = false;
   private mcplToolRefreshPending = false;
   /** Maps tool prefix → serverId for dispatch routing. */
@@ -1000,6 +1355,16 @@ export class AgentFramework {
   private discordAwarenessOutbox: DiscordAwarenessOutbox | null = null;
   private discordAwarenessEmoji = DEFAULT_DISCORD_AWARENESS_EMOJI;
   private discordAwarenessDeadlineMs = DEFAULT_DISCORD_AWARENESS_DEADLINE_MS;
+  /** Durable JSONL record of operator-initiated mutations (see operator-log.ts). */
+  private readonly operatorLog: OperatorLog;
+  /**
+   * Store-wide admission barrier while a live surgery (rollback/suppress)
+   * holds the store. Per-agent turn tokens cover the agents registered when
+   * the reservation was taken; this flag covers everyone else — an ephemeral
+   * agent admitted mid-switch, a wake for an agent created later — at the
+   * scheduler, ephemeral admission and puppet entry points.
+   */
+  private surgeryHold: { verb: string; agentName: string; since: number } | null = null;
   /** Serialize per-server drains so reconnect and an online undo cannot race. */
   private discordAwarenessDrains: Map<string, Promise<DiscordAwarenessDrainOutcome>> = new Map();
   /** Framework-global inference gate; older generations cannot release it. */
@@ -1028,7 +1393,9 @@ export class AgentFramework {
     discordAwarenessOutbox: DiscordAwarenessOutbox | null,
     discordAwarenessEmoji: string,
     discordAwarenessDeadlineMs: number,
+    operatorLog: OperatorLog = new OperatorLog(undefined),
   ) {
+    this.operatorLog = operatorLog;
     this.store = store;
     this.ownsStore = ownsStore;
     this.membrane = membrane;
@@ -1070,6 +1437,9 @@ export class AgentFramework {
    * Create and start the framework.
    */
   static async create(config: FrameworkConfig): Promise<AgentFramework> {
+    // Before anything opens or starts: a refused config must leave nothing behind.
+    if (config.codeExecution?.enabled) validateCodeExecutionConfig(config.codeExecution);
+
     // Create or use existing store
     let store: JsStore;
     let ownsStore: boolean;
@@ -1089,6 +1459,18 @@ export class AgentFramework {
       store.registerState({ id: FRAMEWORK_STATE_ID, strategy: 'snapshot' });
     } catch {
       // Already registered
+    }
+    try {
+      store.registerState({ id: DEFERRED_WRITES_ID, strategy: 'snapshot' });
+    } catch {
+      // Already registered
+    }
+    for (const id of [COALESCING_STATE_ID, COALESCING_RECENT_ID]) {
+      try {
+        store.registerState({ id, strategy: 'snapshot' });
+      } catch {
+        // Already registered
+      }
     }
 
     try {
@@ -1134,6 +1516,18 @@ export class AgentFramework {
       ? new DiscordAwarenessOutbox(discordAwarenessOutboxPath)
       : null;
 
+    const operatorLogPath = config.operatorLogPath === false
+      ? undefined
+      : config.operatorLogPath
+        ?? (config.storePath ? defaultOperatorLogPath(config.storePath) : undefined);
+    if (operatorLogPath === undefined && config.operatorLogPath !== false) {
+      // An audit log that is silently off is worse than none: say so once.
+      console.error(
+        '[operator-log] disabled: no storePath and no operatorLogPath configured — ' +
+          'operator actions will only be visible as operator:action traces',
+      );
+    }
+
     const framework = new AgentFramework(
       store,
       ownsStore,
@@ -1148,7 +1542,9 @@ export class AgentFramework {
       discordAwarenessOutbox,
       config.discordAwarenessEmoji ?? DEFAULT_DISCORD_AWARENESS_EMOJI,
       normalizeDiscordAwarenessDeadline(config.discordAwarenessDeadlineMs),
+      new OperatorLog(operatorLogPath),
     );
+    framework.providerHoldHook = config.providerHold;
 
     // If an offline recovery process crashed after switching Chronicle but
     // before committing its prepared marker batch, the active branch is the
@@ -1275,6 +1671,12 @@ export class AgentFramework {
     // retained when enabled — everything downstream gates on the field.
     framework.codeExecutionConfig = config.codeExecution?.enabled ? config.codeExecution : null;
 
+    framework.toolClassOverrides = normalizeClassTable(config.toolClassOverrides, 'toolClassOverrides');
+    framework.hostToolClasses = [
+      ...normalizeClassTable(config.hostToolClasses, 'hostToolClasses'),
+      ...normalizeClassTable(BUILTIN_TOOL_CLASSES as Record<string, readonly string[]>, 'BUILTIN_TOOL_CLASSES'),
+    ];
+
     if (config.toolResultInlineMaxChars !== undefined) {
       const cap = config.toolResultInlineMaxChars;
       if (!Number.isFinite(cap) || cap < 1000) {
@@ -1287,6 +1689,61 @@ export class AgentFramework {
     // core runtime settings, same framework/state slot (antra + Sol, 08-06).
     for (const [agentName, cap] of Object.entries(framework.readPersistedToolResultInlineCaps())) {
       framework.toolResultInlineMaxCharsOverride.set(agentName, cap);
+    }
+
+    // Restore persisted quiesce mode (issue #122) BEFORE initializeMcpl: the
+    // flag must be set before any data-plane barrier completion can run, or
+    // the startup funnel would open the data planes on a host that shut down
+    // mid-maintenance. Staged connections boot with both planes closed, so a
+    // quiesced boot needs no re-pause — completeMcplDataPlaneGate consults
+    // the flag and holds data planes (control planes come up normally). The
+    // gate already exists at this point, so the suppression is wired here too.
+    //
+    // Both records live OUTSIDE branch history (recovery/ files next to the
+    // store): a historical rollback must not be able to erase the marker of
+    // the very surgery it belongs to, nor orphan the writes deferred by it.
+    framework.hostModePath = config.hostModePath
+      ?? (config.storePath ? join(config.storePath, 'recovery', 'host-mode.json') : undefined);
+    framework.deferredWritesPath = config.deferredWritesPath
+      ?? (config.storePath ? join(config.storePath, 'recovery', 'deferred-writes.json') : undefined);
+    {
+      const hostMode = framework.readHostMode();
+      // Deferred writes are recovered REGARDLESS of the mode flag: a crash
+      // between a resume's flag clear and the end of its flush must not
+      // strand accepted messages. Per-message acks mean only the remainder
+      // replays. Serving boot with a remainder → flush it right now (no turn
+      // is alive yet, so this is a safe boundary).
+      const restoredWrites = framework.restorePersistedDeferredWrites();
+      if (!hostMode?.quiesced && restoredWrites > 0) {
+        console.error(
+          `[host-mode] ${restoredWrites} deferred context write(s) found at a serving boot ` +
+          `(an earlier resume did not finish its flush) — landing them now`,
+        );
+        await framework.flushDeferredWrites('boot-recovery');
+      }
+      if (hostMode?.quiesced) {
+        framework.quiesced = true;
+        framework.quiesceReason = hostMode.reason;
+        framework.quiescedAt = hostMode.since;
+        framework.eventGate?.setQuiesced(true);
+        console.error(
+          `[host-mode] ============================================================\n` +
+          `[host-mode] BOOTING QUIESCED (persisted${hostMode.reason ? `: ${hostMode.reason}` : ''}, ` +
+          `since ${hostMode.since ? new Date(hostMode.since).toISOString() : 'unknown'}).\n` +
+          `[host-mode] No wakes will start turns and MCPL data planes stay paused\n` +
+          `[host-mode] until resume() — via host/command, the API server, or the\n` +
+          `[host-mode] framework API. Wakes parked before the restart were in-memory\n` +
+          `[host-mode] and are gone; recurring sources re-deliver on their own cadence.\n` +
+          `[host-mode] ${restoredWrites} deferred context write(s) restored from the store;\n` +
+          `[host-mode] they land at resume().\n` +
+          `[host-mode] ============================================================`,
+        );
+        framework.emitTrace({
+          type: 'host:quiesced_boot',
+          ...(hostMode.reason ? { reason: hostMode.reason } : {}),
+          ...(hostMode.since !== undefined ? { since: hostMode.since } : {}),
+        });
+      }
     }
 
     // Initialize MCPL subsystems if configured
@@ -1413,7 +1870,12 @@ export class AgentFramework {
    * Stop the event loop.
    */
   async stop(): Promise<void> {
+    this.pushCoalescer?.suspend();
+    this.flushCoalescingSnapshot();
     this.running = false;
+    // Flushed-but-unsynced deferred writes: sync and ack now, while the
+    // store is still open, rather than leaving them to a reboot replay.
+    this.ackDeferredWrites();
     this.providerAdmissionClosed = true;
     this.queue.close();
     this.tuneOutCoordinator?.stop();
@@ -1430,6 +1892,10 @@ export class AgentFramework {
     this.codeExecutionScripts.clear();
     for (const runner of this.codeExecutionRunners.values()) runner.dispose();
     this.codeExecutionRunners.clear();
+    for (const resolve of this.scriptToolWaiters.values()) {
+      resolve({ success: false, error: 'framework stopped', isError: true });
+    }
+    this.scriptToolWaiters.clear();
     // Retained tool images are per-process by design; a retained stopped
     // framework must not keep up to the whole ledger budget referenced.
     this.toolImageLedgers.clear();
@@ -1548,6 +2014,14 @@ export class AgentFramework {
     }
     gate.auxiliaryInFlight++;
     try { return await run(); }
+    catch (error) {
+      // Compression can be the first call to find a spent quota (idle agent,
+      // scheduled maintenance). Arm the host hold so later passes wait at the
+      // gate instead of retrying into it; this pass still fails to its caller.
+      const agent = this.agents.get(agentName);
+      if (agent && error instanceof Error) this.holdProviderAcceleration(agent, error, undefined, true);
+      throw error;
+    }
     finally {
       gate.auxiliaryInFlight = Math.max(0, gate.auxiliaryInFlight - 1);
       if (gate.auxiliaryInFlight === 0) for (const resolve of gate.idleWaiters.splice(0)) resolve();
@@ -1572,29 +2046,77 @@ export class AgentFramework {
   }
   private sameInferenceRequest(a: InferenceRequest, b: InferenceRequest): boolean {
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
-      a.timestamp === b.timestamp && a.channelId === b.channelId;
+      a.timestamp === b.timestamp && a.channelId === b.channelId && a.scriptWakeId === b.scriptWakeId;
   }
-  private holdProviderAcceleration(agent: Agent, error: Error, trigger?: InferenceRequest): boolean {
-    if (this.ephemeralRuns.has(agent.name) || this.conversationAgentHomes.has(agent.name) || !isOrganizationAccelerationRateLimit(error)) return false;
-    const now = Date.now(); const delayMs = this.accelerationCooldownMs(agent.name, error);
+  private consultProviderHold(error: Error, agentName: string): { holdMs: number; reason: string } | undefined {
+    if (!this.providerHoldHook) return undefined;
+    try {
+      const hold = this.providerHoldHook(error, agentName, { model: this.agents.get(agentName)?.model });
+      if (!hold || !Number.isFinite(hold.holdMs) || hold.holdMs <= 0) return undefined;
+      return { holdMs: Math.min(PROVIDER_ACCELERATION_MAX_COOLDOWN_MS, Math.max(1_000, hold.holdMs)),
+        reason: typeof hold.reason === 'string' && hold.reason ? hold.reason : error.message };
+    } catch (err) {
+      console.error(`[provider-cooldown] providerHold hook threw for ${agentName}; treating as no hold:`, err);
+      return undefined;
+    }
+  }
+  /** A host hold whose slice expired: ask the host again before spending an
+   *  inference on it. True = extended in place (held requests stay held). */
+  private extendHostProviderHold(agentName: string, cooldown: ProviderAccelerationCooldown): boolean {
+    if (!cooldown.hostHoldError) return false;
+    const hold = this.consultProviderHold(cooldown.hostHoldError, agentName);
+    if (!hold) return false;
+    clearTimeout(cooldown.timer);
+    cooldown.until = Date.now() + hold.holdMs;
+    cooldown.timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agentName), hold.holdMs);
+    cooldown.timer.unref?.();
+    if (hold.reason !== cooldown.reason) {
+      cooldown.reason = hold.reason;
+      console.error(`[provider-cooldown] agent=${agentName} host hold extended — ${hold.reason}`);
+    }
+    return true;
+  }
+  private holdProviderAcceleration(agent: Agent, error: Error, trigger?: InferenceRequest, auxiliary = false): boolean {
+    if (this.ephemeralRuns.has(agent.name) || this.conversationAgentHomes.has(agent.name)) return false;
+    // The host knows more than the message wording does: ask it first. An
+    // auxiliary failure arms host holds only — the built-in acceleration
+    // cooldown stays a primary-path mechanism.
+    const hostHold = this.consultProviderHold(error, agent.name);
+    const acceleration = !hostHold && !auxiliary && isOrganizationAccelerationRateLimit(error);
+    if (!acceleration && !hostHold) return false;
+    const now = Date.now(); const delayMs = hostHold ? hostHold.holdMs : this.accelerationCooldownMs(agent.name, error as MembraneError);
     const existing = this.providerAccelerationCooldowns.get(agent.name);
     const held = existing?.heldRequests ?? [];
     if (trigger && !held.some((r) => this.sameInferenceRequest(r, trigger))) held.push(trigger);
     if (existing) clearTimeout(existing.timer);
     const timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agent.name), delayMs); timer.unref?.();
     this.providerAccelerationCooldowns.set(agent.name, { startedAt: existing?.startedAt ?? now,
-      until: now + delayMs, timer, heldRequests: held, reason: error.message,
-      failures: (existing?.failures ?? 0) + 1 });
+      until: now + delayMs, timer, heldRequests: held, reason: hostHold?.reason ?? error.message,
+      failures: (existing?.failures ?? 0) + 1, ...(hostHold ? { hostHoldError: error } : {}),
+      ...(auxiliary && (!existing || existing.auxiliaryOrigin) ? { auxiliaryOrigin: true } : {}) });
+    if (auxiliary && !existing) {
+      console.error(`[provider-cooldown] agent=${agent.name} host hold (${hostHold!.reason}) from an auxiliary call — ` +
+        `holding primary/auxiliary for ${delayMs}ms`);
+      return true;
+    }
     const gate = this.providerGate(agent.name); gate.primaryPending = true;
     this.providerAccelerationRecoveries.set(agent.name, { startedAt: existing?.startedAt ?? now,
       failures: (existing?.failures ?? 0) + 1, heldRequests: held.length, reason: error.message });
-    console.error(`[provider-cooldown] agent=${agent.name} organization acceleration 429 — ` +
+    console.error(`[provider-cooldown] agent=${agent.name} ` +
+      `${hostHold ? `host hold (${hostHold.reason})` : 'organization acceleration 429'} — ` +
       `holding primary/auxiliary for ${delayMs}ms; ${held.length} request(s) retained`);
     return true;
   }
   private releaseProviderAccelerationCooldown(agentName: string): void {
     const cooldown = this.providerAccelerationCooldowns.get(agentName); if (!cooldown) return;
+    if (this.extendHostProviderHold(agentName, cooldown)) return;
     clearTimeout(cooldown.timer); this.providerAccelerationCooldowns.delete(agentName);
+    if (cooldown.auxiliaryOrigin && cooldown.heldRequests.length === 0) {
+      // Nobody asked for an inference while parked: just reopen the gate.
+      console.error(`[provider-cooldown] agent=${agentName} auxiliary hold released after ${Date.now() - cooldown.startedAt}ms`);
+      this.flushAuxiliaryAdmission(agentName);
+      return;
+    }
     const recovery = this.providerAccelerationRecoveries.get(agentName);
     if (recovery) { recovery.releasedAt = Date.now(); recovery.heldRequests = cooldown.heldRequests.length; }
     const requests = cooldown.heldRequests.length > 0 ? cooldown.heldRequests : [{ agentName,
@@ -1746,6 +2268,10 @@ export class AgentFramework {
    * Push a process event to the queue.
    */
   pushEvent(event: ProcessEvent): void {
+    // Dispatched tools can outlive Python and the host itself. Their late
+    // results have no consumer after shutdown; pushing them into the closed
+    // queue would turn an ordinary RPC completion into an unhandled rejection.
+    if (event.type === 'tool-result' && this.queue.isClosed) return;
     this.queue.push(event);
     this.emitTrace({ type: 'process:received', processEvent: event });
   }
@@ -2162,21 +2688,74 @@ export class AgentFramework {
   updateAgentRuntimeSettings(
     agentName: string,
     patch: AgentRuntimeSettingsPatch,
-    opts?: { persist?: boolean },
+    opts?: { persist?: boolean; allowInfeasible?: boolean; requester?: OperatorRequester; note?: string },
   ): AgentRuntimeSettingsSnapshot {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    // Feasibility preflight — only a budget-bearing patch can wedge, and only
+    // on the immediate path (a paced descent leaves the compile budget alone
+    // and converges only as far as the folded floor allows). Boot restore
+    // deliberately bypasses this wrapper (createAgent → restoreRuntimeSettings),
+    // so a persisted-but-now-infeasible budget can never brick startup.
+    if (patch.contextBudgetTokens !== undefined) {
+      const preview = this.previewAgentRuntimeSettings(agentName, patch);
+      if (preview.available && preview.effective) {
+        const e = preview.effective;
+        // Block only a LOWERING that doesn't fit. A no-op rewrite or an
+        // increase on an already-over-floor agent never makes things worse —
+        // refusing those would throw on exactly the wedged population the
+        // guard exists to protect (and block stepwise remediation).
+        const lowering = patch.contextBudgetTokens! < preview.liveBudgetTokens;
+        if (preview.path === 'immediate' && !e.fits && lowering) {
+          const msg =
+            `[budget-preflight] contextBudgetTokens=${patch.contextBudgetTokens} would NOT fit ` +
+            `${agentName}: the folded floor renders ${e.finalTokens} tokens against hard budget ` +
+            `${e.budgetTokens} (head=${e.headTokens ?? '?'} tail=${e.tailTokens ?? '?'} ` +
+            `middle=${e.middleTokens ?? '?'}, deepest L${e.deepestLevel ?? '?'}` +
+            `${e.exhausted ? ', picker exhausted' : ''}). Every compile at this budget would ` +
+            `OverBudget-wedge the agent. Lower the floor first (drain compression quarantine / ` +
+            `advance the merge ladder), use a paced descent (no \`immediate\`), or pass allowInfeasible.`;
+          if (!opts?.allowInfeasible) throw new BudgetPreflightError(msg, preview);
+          console.warn(`${msg} — applying anyway (allowInfeasible).`);
+        } else if (preview.path === 'immediate' && !e.fits) {
+          console.warn(
+            `[budget-preflight] ${agentName} remains over the folded floor at ` +
+            `${patch.contextBudgetTokens} (floor renders ${e.finalTokens}); this patch does ` +
+            `not lower the budget, so applying — drain quarantine / advance merges to clear it.`,
+          );
+        } else if (preview.path === 'paced' && preview.advisory && !preview.advisory.fits) {
+          console.warn(
+            `[budget-preflight] paced descent for ${agentName} targets ` +
+            `${preview.advisory.targetTokens} tokens, below the current folded floor — the ` +
+            `transition will converge only as far as the floor allows (drain quarantine / ` +
+            `advance merges to go lower). Applying; the live compile budget is unchanged.`,
+          );
+        }
+      } else if (preview.reason) {
+        console.warn(
+          `[budget-preflight] preview unavailable for ${agentName} (${preview.reason}); ` +
+          `applying without preflight`,
+        );
+      }
+    }
     const result = agent.updateRuntimeSettings(patch);
     if (opts?.persist !== false) {
       this.persistAgentRuntimeSettings(agentName, agent.getRuntimeSettingsOverrides());
     }
+    this.recordOperatorAction({
+      kind: 'settings-update',
+      agent: agentName,
+      ...(opts?.requester ? { requester: opts.requester } : {}),
+      ...(opts?.note ? { note: opts.note } : {}),
+      params: { patch: { ...patch }, persist: opts?.persist !== false },
+    });
     return result;
   }
 
   resetAgentRuntimeSettings(
     agentName: string,
     keys?: Array<keyof AgentRuntimeSettingsPatch>,
-    opts?: { persist?: boolean },
+    opts?: { persist?: boolean; requester?: OperatorRequester; note?: string },
   ): AgentRuntimeSettingsSnapshot {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
@@ -2184,15 +2763,656 @@ export class AgentFramework {
     if (opts?.persist !== false) {
       this.persistAgentRuntimeSettings(agentName, agent.getRuntimeSettingsOverrides());
     }
+    this.recordOperatorAction({
+      kind: 'settings-reset',
+      agent: agentName,
+      ...(opts?.requester ? { requester: opts.requester } : {}),
+      ...(opts?.note ? { note: opts.note } : {}),
+      params: { keys: keys ?? 'all', persist: opts?.persist !== false },
+    });
     return result;
   }
 
-  cancelAgentRuntimeSettingsTransition(agentName: string): AgentRuntimeSettingsSnapshot {
+  cancelAgentRuntimeSettingsTransition(
+    agentName: string,
+    opts?: { requester?: OperatorRequester },
+  ): AgentRuntimeSettingsSnapshot {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
     const result = agent.cancelRuntimeSettingsTransition();
     this.persistAgentRuntimeSettings(agentName, agent.getRuntimeSettingsOverrides());
+    this.recordOperatorAction({
+      kind: 'settings-cancel-transition',
+      agent: agentName,
+      ...(opts?.requester ? { requester: opts.requester } : {}),
+    });
     return result;
+  }
+
+  // -------------------------------------------------------------------------
+  // Host quiesce / maintenance mode (issue #122)
+  //
+  // Pause the inference thread and MCPL data planes while keeping the
+  // framework + context managers + membrane loaded and hot, so maintenance
+  // (compression ticks, refold, quarantine drains, budget descents) runs
+  // through the exact machinery the agent uses live — with live config, live
+  // tool definitions, and full llm-calls logging — instead of offline rigs
+  // that re-derive all of it and drift.
+  //
+  // While quiesced: runLoop, store sync, the maintenance timer, and the
+  // liveness watchdog all keep running. Wakes park in pendingRequests
+  // (coalesced per reason) and fire at resume; MCPL events buffer on the
+  // paused data planes; gate debounces buffer in the gate. Background
+  // code-execution scripts are NOT stopped (they hold no turn token) — they
+  // are reported in the status so the operator sees what still acts.
+  //
+  // NOTE: do not call quiesce() from inside a queue event handler — the drain
+  // wait depends on the event loop continuing to run.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Wakes that passed the scheduler and now own provider admission while
+   * waiting for an in-flight auxiliary call to settle — no turn token yet,
+   * so `activeTurnTokens` alone would call the host drained while a turn is
+   * one promise-resolution away from starting. The admission continuation
+   * rechecks quiesce and requeues, but until it runs the wake is live.
+   */
+  private parkedAdmissionCount(): number {
+    let n = 0;
+    for (const [agentName, gate] of this.providerGates) {
+      if (gate.primaryDepth > 0 && !this.activeTurnTokens.has(agentName)) n++;
+    }
+    return n;
+  }
+
+  getHostModeStatus(): HostModeStatus {
+    const parkedAdmissions = this.parkedAdmissionCount();
+    return {
+      quiesced: this.quiesced,
+      ...(this.quiesceReason ? { reason: this.quiesceReason } : {}),
+      ...(this.quiescedAt !== undefined ? { since: this.quiescedAt } : {}),
+      drained: this.activeTurnTokens.size === 0 && parkedAdmissions === 0,
+      activeTurns: this.activeTurnTokens.size,
+      parkedAdmissions,
+      gatedRequests: this.pendingRequests.filter((r) => !isTurnContinuation(r.reason)).length,
+      backgroundScripts: [...this.codeExecutionScripts.values()]
+        .filter((record) => record.mode === 'background' && record.status === 'running').length,
+      deferredWrites: this.deferredMessages.length,
+      ...(this.lastUnabandonable.length > 0 ? { unabandonable: [...this.lastUnabandonable] } : {}),
+    };
+  }
+
+  /** Drain window bounds shared by every ingress (framework API, WS, HTTP,
+   *  host/command). Below the floor a drain is meaningless; above the ceiling
+   *  an awaited call would poll for days. */
+  static readonly QUIESCE_TIMEOUT_MIN_MS = 1_000;
+  static readonly QUIESCE_TIMEOUT_MAX_MS = 600_000;
+  static readonly QUIESCE_TIMEOUT_DEFAULT_MS = 120_000;
+
+  /**
+   * Enter quiesce mode: persist the flag, suppress gate deliveries, pause all
+   * MCPL data planes, and wait for in-flight turns to settle (turn-alive is
+   * `activeTurnTokens`, which spans dequeue → settled teardown). Idempotent.
+   *
+   * On drain timeout the host STAYS quiesced (`drained: false` in the
+   * result); with `abandon: true` the undrained streams are cancelled via a
+   * dedicated cancel kind that settles the turn without feeding the
+   * inference-failure accounting.
+   */
+  async quiesce(opts?: {
+    reason?: string;
+    timeoutMs?: number;
+    abandon?: boolean;
+  }): Promise<HostModeStatus> {
+    if (this.quiesced) {
+      // Idempotent — EXCEPT abandon escalation: a first quiesce that timed
+      // out undrained must be escalatable with a second quiesce({abandon})
+      // without resume()+re-quiesce (which would reopen data planes and
+      // release parked wakes mid-surgery).
+      if (opts?.abandon && this.activeTurnTokens.size > 0) {
+        const unabandonable = await this.abandonActiveTurns();
+        this.emitTrace({
+          type: 'host:quiesce',
+          ...(this.quiesceReason ? { reason: this.quiesceReason } : {}),
+          drained: this.activeTurnTokens.size === 0,
+          activeTurns: this.activeTurnTokens.size,
+          abandoned: true,
+          ...(unabandonable.length > 0 ? { unabandonable } : {}),
+        });
+      }
+      return this.getHostModeStatus();
+    }
+    this.quiesced = true;
+    this.quiesceReason = opts?.reason;
+    this.quiescedAt = Date.now();
+    this.lastUnabandonable = [];
+    this.persistHostMode({
+      quiesced: true,
+      ...(opts?.reason ? { reason: opts.reason } : {}),
+      since: this.quiescedAt,
+    });
+    console.error(
+      `[host-mode] quiescing${opts?.reason ? ` (${opts.reason})` : ''}: parking wakes, ` +
+      `pausing MCPL data planes, draining ${this.activeTurnTokens.size} in-flight turn(s)`,
+    );
+    this.eventGate?.setQuiesced(true);
+    for (const connection of this.mcplServerRegistry?.getAllServers() ?? []) {
+      connection.pauseDataPlane();
+    }
+
+    // Clamp HERE, for every ingress. NaN-proof too: timeoutMs arrives via
+    // Number()/blind casts, and Math.max(1_000, NaN) is NaN — which would
+    // silently collapse the drain window to zero (`Date.now() < NaN` is
+    // false). The ceiling matters because this call is awaited: an
+    // unbounded value polls the event loop for as long as it says.
+    const rawTimeout = opts?.timeoutMs;
+    const timeoutMs = typeof rawTimeout === 'number' && Number.isFinite(rawTimeout)
+      ? Math.max(
+          AgentFramework.QUIESCE_TIMEOUT_MIN_MS,
+          Math.min(AgentFramework.QUIESCE_TIMEOUT_MAX_MS, Math.floor(rawTimeout)),
+        )
+      : AgentFramework.QUIESCE_TIMEOUT_DEFAULT_MS;
+    const deadline = Date.now() + timeoutMs;
+    // Drain = no turn token AND no wake parked on provider admission (the
+    // latter becomes a turn the moment its auxiliary settles unless the
+    // continuation's quiesce recheck requeues it — wait for that to happen).
+    while (
+      this.quiesced &&
+      (this.activeTurnTokens.size > 0 || this.parkedAdmissionCount() > 0) &&
+      Date.now() < deadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+
+    // A concurrent resume() ended this window while we waited. Nothing here
+    // may act any more — an abandon now would cancel a turn that started
+    // legitimately AFTER the resume, and the trace/log would describe a mode
+    // the host is no longer in.
+    if (!this.quiesced) {
+      console.error('[host-mode] quiesce superseded by a concurrent resume during drain');
+      return this.getHostModeStatus();
+    }
+
+    let abandoned = false;
+    let unabandonable: string[] = [];
+    if (this.activeTurnTokens.size > 0 && opts?.abandon) {
+      abandoned = true;
+      unabandonable = await this.abandonActiveTurns();
+      if (!this.quiesced) return this.getHostModeStatus();
+    }
+
+    const status = this.getHostModeStatus();
+    this.emitTrace({
+      type: 'host:quiesce',
+      ...(this.quiesceReason ? { reason: this.quiesceReason } : {}),
+      drained: status.drained,
+      activeTurns: status.activeTurns,
+      ...(status.parkedAdmissions > 0 ? { parkedAdmissions: status.parkedAdmissions } : {}),
+      ...(abandoned ? { abandoned: true } : {}),
+      ...(unabandonable.length > 0 ? { unabandonable } : {}),
+    });
+    console.error(
+      status.drained
+        ? `[host-mode] quiesced — drained, ${status.gatedRequests} wake(s) parked`
+        : `[host-mode] quiesced but drain ${abandoned ? 'needed abandon and' : 'timed out —'} ` +
+          `${status.activeTurns} turn(s) still alive` +
+          (status.parkedAdmissions > 0
+            ? `, ${status.parkedAdmissions} wake(s) parked on provider admission`
+            : ''),
+    );
+    return status;
+  }
+
+  /** Cancel every turn-alive stream via the quiesce_abandoned kind and give
+   *  teardown a bounded grace to settle. Shared by the drain-timeout path and
+   *  the already-quiesced escalation path. */
+  private async abandonActiveTurns(): Promise<string[]> {
+    const unabandonable: string[] = [];
+    for (const agentName of [...this.activeTurnTokens.keys()]) {
+      const agent = this.agents.get(agentName);
+      const state = agent?.state;
+      const stream = state && 'stream' in state ? state.stream : undefined;
+      if (agent && stream) {
+        console.error(`[host-mode] abandoning in-flight turn for ${agentName}`);
+        this.frameworkCancelledStreams.set(
+          `${agent.name}:${agent.streamId}`,
+          'quiesce_abandoned',
+        );
+        stream.cancel();
+      } else {
+        // Token held, no stream to cancel: the turn is between dequeue and
+        // stream registration (hooks/compile), or it is a puppet tool turn,
+        // which never has one. Say so — silence here reads as "abandon acted
+        // and teardown is slow", which is a different operator decision.
+        unabandonable.push(agentName);
+        console.error(
+          `[host-mode] cannot abandon turn for ${agentName}: turn token held with no stream ` +
+          `(status=${state?.status ?? 'unknown'}) — it must settle on its own`,
+        );
+      }
+    }
+    // Bounded grace for the cancelled streams' teardown to settle.
+    const grace = Date.now() + 10_000;
+    while (this.quiesced && this.activeTurnTokens.size > 0 && Date.now() < grace) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    // Only turns still alive after the grace are worth reporting.
+    this.lastUnabandonable = unabandonable.filter((name) => this.activeTurnTokens.has(name));
+    return this.lastUnabandonable;
+  }
+
+  /**
+   * Leave quiesce mode. Gates on a FRESH feasibility preview of every agent's
+   * CURRENT settings — maintenance may have moved the folded floor and the
+   * branch generation, so verdicts are computed at resume time, never reused.
+   * Throws ResumeBlockedError (with all failing verdicts) unless `force`.
+   * Unavailable previews warn and pass — refusing to resume because the
+   * strategy cannot preview would hold hosts hostage to a diagnostic.
+   */
+  async resume(opts?: { force?: boolean }): Promise<HostModeStatus> {
+    if (!this.quiesced) return this.getHostModeStatus();
+
+    // The canonical operator flow is `maintain; resume`, and a timer-driven
+    // pass may still be mid-flight: previewContext refuses to overlap one
+    // ("already running"), which used to degrade the gate to "no opinion".
+    // Wait for the pass first, then retry a few times for the case where a
+    // fresh pass started in between.
+    if (this.maintenancePass) {
+      await this.maintenancePass.catch(() => {});
+    }
+    const failing: Array<{ agentName: string; preview: RuntimeSettingsPreview }> = [];
+    for (const agentName of this.agents.keys()) {
+      let preview = this.previewAgentRuntimeSettings(agentName);
+      for (let attempt = 0; attempt < 8 && !preview.available && preview.reason === 'preview_in_flight'; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        if (this.maintenancePass) await this.maintenancePass.catch(() => {});
+        preview = this.previewAgentRuntimeSettings(agentName);
+      }
+      if (preview.available && preview.effective && !preview.effective.fits) {
+        failing.push({ agentName, preview });
+      } else if (!preview.available && preview.reason !== 'no_preview_support') {
+        console.warn(
+          `[host-mode] resume: feasibility preview unavailable for ${agentName} ` +
+          `(${preview.reason}) — proceeding without a verdict`,
+        );
+      }
+    }
+    if (failing.length > 0 && !opts?.force) {
+      const detail = failing.map(({ agentName, preview }) =>
+        `${agentName}: folded floor ${preview.effective!.finalTokens} > hard budget ` +
+        `${preview.effective!.budgetTokens}` +
+        (preview.transition === 'blocked'
+          ? ` (transition blocked: ${preview.transitionReason ?? 'unknown'})`
+          : ''),
+      ).join('; ');
+      throw new ResumeBlockedError(
+        `resume refused: returning to service would OverBudget-wedge — ${detail}. ` +
+        `Drain compression quarantine / advance the merge ladder to lower the floor ` +
+        `(maintenanceTick()), or resume({ force: true }).`,
+        failing,
+      );
+    }
+    if (failing.length > 0) {
+      console.warn(
+        `[host-mode] resume FORCED past ${failing.length} failing feasibility verdict(s)`,
+      );
+    }
+
+    const releasedRequests = this.pendingRequests.length;
+    // In-memory first: addMessage must stop deferring so the flush below can
+    // land. The DURABLE flag is cleared only after the flush completes — a
+    // crash in between then boots quiesced with the un-acked remainder
+    // restored (and a serving boot recovers any remainder anyway).
+    this.quiesced = false;
+    this.quiesceReason = undefined;
+    this.quiescedAt = undefined;
+    this.lastUnabandonable = [];
+    this.eventGate?.setQuiesced(false);
+
+    try {
+      // Flush context writes deferred by the quiesce window (module events,
+      // api message.send) — with no turn alive there is no other flush
+      // point. Per-message try/catch and per-message durable ack (see
+      // flushDeferredWrites); nothing here may reach the plane reopen below.
+      await this.flushDeferredWrites('resume');
+      this.persistHostMode(null);
+    } finally {
+      // Reopen MCPL data planes through the existing barrier funnel — NOT a
+      // bespoke ready() loop. The funnel inherits completeMcplDataPlaneGate's
+      // nested-install guard (a flushed tools-list-changed can install a
+      // newer barrier mid-flush), drains any awareness work accumulated
+      // during the window before opening, and replaces a stale failed
+      // barrier by identity. In `finally` so that nothing above can leave
+      // the host un-quiesced with every data plane still paused.
+      if (this.mcplServerRegistry) {
+        const barrier = this.installMcplDataPlaneGate();
+        this.releaseMcplDataPlaneGate(barrier);
+        try {
+          await barrier.promise;
+          this.completeMcplDataPlaneGate(barrier);
+        } catch (error) {
+          // The host IS resumed — don't rethrow. failMcplDataPlaneGate
+          // recycles the connections, and their reconnect flows re-run the
+          // funnel with quiesced=false, self-healing the data planes.
+          await this.failMcplDataPlaneGate(barrier, 'quiesce resume', error);
+        }
+      }
+
+      this.emitTrace({
+        type: 'host:resume',
+        ...(opts?.force && failing.length > 0 ? { forced: true } : {}),
+        releasedRequests,
+      });
+      // NOTE: parked wakes and gate buffers are in-memory only — a restart
+      // mid-quiesce boots quiesced but with these queues empty (sources like
+      // heartbeats re-deliver on their own cadence; one-shot wakes are lost).
+      // Deferred context WRITES are persisted while quiesced and survive.
+      console.error(`[host-mode] resumed — ${releasedRequests} parked wake(s) released`);
+    }
+    return this.getHostModeStatus();
+  }
+
+  /**
+   * Land every deferred write whose target has no turn alive, one at a time,
+   * acknowledging each durably as it lands (the persisted queue is rewritten
+   * after every message). A crash mid-flush therefore replays exactly the
+   * un-acked remainder at the next boot — no loss, no duplicates. A write
+   * the store REJECTS is logged and acked too: replaying a poison message
+   * forever would wedge every later boot on it.
+   *
+   * Per-target: an agent whose turn is still alive keeps ITS messages
+   * deferred for its own turn boundary; everyone else's flush now.
+   */
+  private async flushDeferredWrites(label: string): Promise<void> {
+    if (this.deferredMessages.length === 0) {
+      this.persistDeferredWrites();
+      return;
+    }
+    const keep: typeof this.deferredMessages = [];
+    const flush: typeof this.deferredMessages = [];
+    for (const msg of this.deferredMessages) {
+      const target = msg.forAgent ?? this.primaryAgentName;
+      (target && this.activeTurnTokens.has(target) ? keep : flush).push(msg);
+    }
+    // Hand-off: the batch leaves the pending queue and enters the un-acked
+    // set. The DURABLE queue (pending + un-acked) is unchanged by this, so a
+    // crash anywhere below replays the whole batch, and the deferredWriteId
+    // stamped on each stored message lets boot skip the ones that did land.
+    flush.sort(bySeq);
+    this.deferredMessages = keep;
+    this.handOffDeferredWrites(flush);
+    let stored = 0;
+    for (const msg of flush) {
+      try {
+        this.addMessage(msg.participant, msg.content, msg.metadata, {
+          deferredWriteId: msg.id,
+          ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
+        });
+        stored++;
+      } catch (err) {
+        console.error(
+          `[host-mode] ${label}: failed to store a deferred context write ` +
+          `(participant=${msg.participant}, forAgent=${msg.forAgent ?? 'primary'}):`,
+          err,
+        );
+      }
+    }
+    // Ack = sync the chronicle FIRST, then rewrite the durable queue without
+    // the batch. Never the other way round.
+    this.ackDeferredWrites();
+    console.error(
+      `[host-mode] ${label}: flushed ${stored}/${flush.length} deferred context write(s)` +
+      (keep.length > 0 ? `, ${keep.length} kept for a still-alive turn` : ''),
+    );
+  }
+
+  /**
+   * Acknowledge every deferred write that has been handed to a context
+   * manager: sync the chronicle so the appended slots are durable, and only
+   * then drop them from the recovery queue. If the sync fails they stay in
+   * the durable queue (the next ack, or stop(), retries); a reboot in that
+   * state replays them, deduplicated by `deferredWriteId` for any that did
+   * reach disk. Idempotent and cheap when nothing is un-acked.
+   */
+  private ackDeferredWrites(): void {
+    if (this.unackedDeferredWrites.length === 0) return;
+    // Nothing durable to reconcile against unless the queue was persisted.
+    if (!this.deferredWritesPersisted && !this.quiesced) {
+      this.unackedDeferredWrites = [];
+      return;
+    }
+    try {
+      this.store.sync();
+    } catch (err) {
+      console.error(
+        `[host-mode] chronicle sync failed — ${this.unackedDeferredWrites.length} flushed deferred ` +
+        `write(s) stay in the recovery queue until a sync succeeds:`,
+        err,
+      );
+      return;
+    }
+    this.unackedDeferredWrites = [];
+    this.deferredScanFrom.clear();
+    this.persistDeferredWrites();
+  }
+
+  /**
+   * Move drained entries into the un-acked set and record, per target
+   * agent, the store position they will be appended after — then persist
+   * that receipt BEFORE any of them is written. Boot recovery scans from the
+   * recorded position to the tail, so every member of an interrupted batch
+   * is visible to the dedup, however large the batch.
+   */
+  private handOffDeferredWrites(entries: DeferredWrite[]): void {
+    if (entries.length === 0) return;
+    const durable = this.deferredWritesPersisted || this.quiesced;
+    if (!durable) return; // memory-only deferrals: nothing to reconcile at boot
+    for (const entry of entries) {
+      const target = entry.forAgent ?? this.primaryAgentName;
+      const agent = target ? this.agents.get(target) : undefined;
+      if (!agent) continue;
+      let count = 0;
+      try {
+        const cm = agent.getContextManager() as unknown as { getMessageCount?: () => number; getAllMessages: () => unknown[] };
+        count = typeof cm.getMessageCount === 'function' ? cm.getMessageCount() : cm.getAllMessages().length;
+      } catch { count = 0; }
+      const prev = this.deferredScanFrom.get(target!);
+      this.deferredScanFrom.set(target!, prev === undefined ? count : Math.min(prev, count));
+    }
+    this.unackedDeferredWrites.push(...entries);
+    this.persistDeferredWrites();
+  }
+
+  /**
+   * Which of `ids` already exist in some agent's store as a landed deferred
+   * write (`metadata.deferredWriteId`). Scans each context manager's recent
+   * tail blob-free — an interrupted flush is always within the last few
+   * hundred slots — and tolerates facades without windowed reads.
+   */
+  private landedDeferredWriteIds(ids: Set<string>, scanFrom: Map<string, number>): Set<string> {
+    const landed = new Set<string>();
+    if (ids.size === 0) return landed;
+    const WINDOW = 500;
+    for (const agent of this.agents.values()) {
+      try {
+        const cm = agent.getContextManager() as unknown as {
+          getMessageCount?: () => number;
+          getMessageWindow?: (o: number, l: number, opts?: { resolveBlobs?: boolean }) =>
+            { messages: Array<{ metadata?: Record<string, unknown> }> };
+          getAllMessages: () => Array<{ metadata?: Record<string, unknown> }>;
+        };
+        const consider = (m: { metadata?: Record<string, unknown> }): void => {
+          const id = m.metadata?.deferredWriteId;
+          if (typeof id === 'string' && ids.has(id)) landed.add(id);
+        };
+        if (typeof cm.getMessageCount === 'function' && typeof cm.getMessageWindow === 'function') {
+          const total = cm.getMessageCount();
+          // From the receipt position (0 = whole store when unknown) to the
+          // tail, in blob-free windows — the batch can only be after it.
+          const from = Math.min(scanFrom.get(agent.name) ?? 0, total);
+          for (let start = from; start < total; start += WINDOW) {
+            const win = cm.getMessageWindow(start, Math.min(WINDOW, total - start), { resolveBlobs: false });
+            for (const m of win.messages) consider(m);
+          }
+        } else {
+          for (const m of cm.getAllMessages()) consider(m);
+        }
+      } catch (err) {
+        console.error(`[host-mode] could not scan ${agent.name} for landed deferred writes:`, err);
+      }
+    }
+    return landed;
+  }
+
+  /** Atomic JSON write for the recovery files (tmp + rename, 0600) — the
+   *  same idiom as the Discord awareness outbox. */
+  private writeRecoveryFile(path: string, document: unknown): void {
+    mkdirSync(dirname(path), { recursive: true });
+    const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(temporary, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 });
+    renameSync(temporary, path);
+  }
+
+  private readRecoveryFile(path: string): unknown {
+    if (!existsSync(path)) return undefined;
+    return JSON.parse(readFileSync(path, 'utf8'));
+  }
+
+  private warnRecoveryFallbackOnce(): void {
+    if (this.recoveryFallbackWarned) return;
+    this.recoveryFallbackWarned = true;
+    console.error(
+      '[host-mode] no storePath / hostModePath / deferredWritesPath: quiesce state and deferred ' +
+      'writes persist in the branch-local framework/state slot — a historical rollback while ' +
+      'quiesced can erase them; configure the recovery paths',
+    );
+  }
+
+  /**
+   * Mirror the deferred-write queue durably while quiesced (and until an
+   * already-persisted queue drains). The quiesce flag itself is persisted
+   * because a crash mid-surgery is an expected event; the messages withheld
+   * BECAUSE of that surgery would otherwise die with the process — and the
+   * window is operator-length, not turn-length. Lives in the
+   * branch-independent recovery file so a rollback cannot orphan it.
+   * Deferrals outside a quiesce window (turn-alive, mid-tool-cycle) are
+   * still memory-only: they flush within the turn, as before.
+   */
+  private persistDeferredWrites(): void {
+    try {
+      // The durable queue is everything not yet acked: writes still pending
+      // AND writes handed to a context manager whose sync has not happened.
+      // Always in original deferral order, whatever the pending/un-acked
+      // split: a re-deferred entry must not jump the queue.
+      const durable = [...this.unackedDeferredWrites, ...this.deferredMessages].sort(bySeq);
+      const scanFrom = Object.fromEntries(this.deferredScanFrom);
+      if ((this.quiesced || this.deferredWritesPersisted) && durable.length > 0) {
+        const payload = JSON.stringify(durable);
+        if (payload.length > DEFERRED_WRITES_PERSIST_CAP_BYTES) {
+          if (!this.deferredWritesCapWarned) {
+            this.deferredWritesCapWarned = true;
+            console.error(
+              `[host-mode] deferred context writes exceed ${DEFERRED_WRITES_PERSIST_CAP_BYTES} bytes ` +
+              `serialized (${durable.length} message(s)) — kept in memory only; ` +
+              `a crash before resume loses them`,
+            );
+          }
+          return;
+        }
+        if (this.deferredWritesPath) {
+          this.writeRecoveryFile(this.deferredWritesPath, { version: 2, pending: durable, scanFrom });
+        } else {
+          this.warnRecoveryFallbackOnce();
+          this.store.setStateJson(DEFERRED_WRITES_ID, { version: 2, pending: durable, scanFrom });
+        }
+        this.deferredWritesPersisted = true;
+      } else if (this.deferredWritesPersisted) {
+        if (this.deferredWritesPath) {
+          this.writeRecoveryFile(this.deferredWritesPath, { version: 1, pending: [] });
+        } else {
+          this.store.setStateJson(DEFERRED_WRITES_ID, []);
+        }
+        this.deferredWritesPersisted = false;
+      }
+    } catch (err) {
+      console.error('[host-mode] failed to persist deferred context writes:', err);
+    }
+  }
+
+  private restorePersistedDeferredWrites(): number {
+    try {
+      let raw: unknown;
+      if (this.deferredWritesPath && existsSync(this.deferredWritesPath)) {
+        raw = this.readRecoveryFile(this.deferredWritesPath);
+      } else {
+        // Stores that predate the recovery file (or store-only configs).
+        raw = this.store.getStateJson(DEFERRED_WRITES_ID);
+      }
+      // v1 slot payloads were a bare array; v1/v2 files and v2 slots are
+      // `{ pending, scanFrom? }`.
+      const doc = Array.isArray(raw) ? { pending: raw } : (raw as { pending?: unknown; scanFrom?: unknown } | undefined);
+      const data = doc?.pending;
+      if (!Array.isArray(data) || data.length === 0) return 0;
+      const scanFrom = new Map<string, number>();
+      if (doc?.scanFrom && typeof doc.scanFrom === 'object') {
+        for (const [k, v] of Object.entries(doc.scanFrom as Record<string, unknown>)) {
+          if (typeof v === 'number' && Number.isFinite(v)) scanFrom.set(k, Math.max(0, Math.floor(v)));
+        }
+      }
+      const candidates = data
+        .filter((m): m is Omit<DeferredWrite, 'id' | 'seq'> & { id?: string; seq?: number } =>
+          !!m && typeof m === 'object' && typeof (m as { participant?: unknown }).participant === 'string'
+            && Array.isArray((m as { content?: unknown }).content))
+        .map((m, i) => ({
+          ...m,
+          id: typeof m.id === 'string' ? m.id : randomUUID(),
+          // Files that predate `seq` are in write order already.
+          seq: typeof m.seq === 'number' ? m.seq : i + 1,
+        }))
+        .sort(bySeq);
+      this.deferredSeq = Math.max(this.deferredSeq, ...candidates.map((m) => m.seq));
+      // Exactly-once: a message that landed before its ack was written is
+      // already in the store under its deferredWriteId — do not replay it.
+      // The scan covers every slot the interrupted batch could occupy (from
+      // the receipt's per-agent position), or the whole store when the
+      // receipt predates the position field.
+      const landed = this.landedDeferredWriteIds(new Set(candidates.map((m) => m.id)), scanFrom);
+      const restored = candidates.filter((m) => !landed.has(m.id));
+      if (landed.size > 0) {
+        console.error(
+          `[host-mode] ${landed.size} deferred context write(s) had already landed before their ack ` +
+          `(interrupted flush) — skipped, not replayed`,
+        );
+      }
+      this.deferredMessages.push(...restored);
+      this.deferredWritesPersisted = true;
+      // Rewrite the durable queue without the already-landed entries so a
+      // second interrupted boot does not re-scan them.
+      if (landed.size > 0) this.persistDeferredWrites();
+      return restored.length;
+    } catch (err) {
+      console.error('[host-mode] failed to restore persisted deferred context writes:', err);
+      return 0;
+    }
+  }
+
+  /**
+   * Operator-driven maintenance: run (or join) one bounded compression pass —
+   * the same runQueuedMaintenance the timer drives, so tool definitions are
+   * refreshed and ticks are bounded/serialized identically — and return the
+   * maintenance snapshot. Works while quiesced by design: `running` stays
+   * true in quiesce mode precisely so this machinery stays hot.
+   */
+  async maintenanceTick(): Promise<ContextMaintenanceSnapshot & { ran: boolean }> {
+    if (!this.running) {
+      // startQueuedMaintenance no-ops on a stopped/never-started framework —
+      // a bare snapshot would masquerade as a completed pass, so say so.
+      console.warn('[host-mode] maintenanceTick: framework is not running — no pass executed');
+      return { ...this.getContextMaintenanceSnapshot(), ran: false };
+    }
+    this.startQueuedMaintenance();
+    await this.maintenancePass;
+    return { ...this.getContextMaintenanceSnapshot(), ran: true };
   }
 
   /** Counts-only context-maintenance diagnostics for authenticated debug UIs. */
@@ -2336,6 +3556,101 @@ export class AgentFramework {
       overrides,
       opts,
     );
+  }
+
+  /**
+   * Feasibility preview for a runtime-settings patch — or, with no patch, for
+   * the agent's CURRENT settings (the resume-gate case: quiesce maintenance
+   * may have moved the folded floor and the branch generation, so the verdict
+   * must be computed fresh at resume time).
+   *
+   * Models the patch through the same immediate-vs-paced semantics as the
+   * apply path (`Agent.planRuntimeSettings`): a non-immediate budget decrease
+   * is previewed at the UNCHANGED live compile budget, with a best-effort
+   * advisory verdict at the descent target. This is what the superseded
+   * `feat/budget-preflight-guard` got wrong — it previewed the patch value as
+   * the compile budget and rejected safe-by-construction paced descents.
+   *
+   * Never throws for preview-layer reasons: strategy without previewContext,
+   * preview overlap, stale branch generation, and the hierarchical (non-
+   * adaptive) path all come back as `{available: false, reason}`. Unknown
+   * agent still throws, matching the sibling accessors.
+   */
+  previewAgentRuntimeSettings(
+    agentName: string,
+    patch?: AgentRuntimeSettingsPatch,
+  ): RuntimeSettingsPreview {
+    const agent = this.agents.get(agentName);
+    if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    const plan = agent.planRuntimeSettings(patch);
+    const settings = agent.getRuntimeSettings();
+    const base: RuntimeSettingsPreview = {
+      available: false,
+      path: plan.path,
+      liveBudgetTokens: plan.liveBudgetTokens,
+      transition: settings.transition,
+      ...(settings.transitionReason ? { transitionReason: settings.transitionReason } : {}),
+    };
+
+    const runPreview = (budgetTokens: number): {
+      result?: Record<string, unknown>;
+      reason?: string;
+    } => {
+      try {
+        const result = this.previewContextSettings(
+          agentName,
+          budgetTokens,
+          Object.keys(plan.overrides).length > 0 ? plan.overrides : undefined,
+        );
+        if (result === null || typeof result !== 'object') {
+          return { reason: 'no_preview_support' };
+        }
+        return { result: result as Record<string, unknown> };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        // Structured mapping of the strategy's known throw paths. Message
+        // matching is fragile by nature, so unknown messages surface verbatim
+        // as the reason rather than being swallowed or rethrown.
+        if (message.includes('requires reinitialization for the current branch generation')) {
+          return { reason: 'branch_generation_changed' };
+        }
+        if (message.includes('already running; previews must not overlap')) {
+          return { reason: 'preview_in_flight' };
+        }
+        if (message.includes('requires adaptiveResolution')) {
+          return { reason: 'no_adaptive_resolution' };
+        }
+        return { reason: message };
+      }
+    };
+
+    const effective = runPreview(plan.effectiveBudgetTokens);
+    if (!effective.result) {
+      return { ...base, reason: effective.reason };
+    }
+    const preview: RuntimeSettingsPreview = {
+      ...base,
+      available: true,
+      effective: {
+        ...effective.result,
+        budgetTokens: plan.effectiveBudgetTokens,
+        fits: effective.result.fits === true,
+        finalTokens: Number(effective.result.finalTokens ?? 0),
+      },
+    };
+    if (plan.advisoryTargetTokens !== undefined) {
+      // Best-effort: an advisory failure never flips `available` — the
+      // effective verdict above is the one that gates anything.
+      const advisory = runPreview(plan.advisoryTargetTokens);
+      if (advisory.result) {
+        preview.advisory = {
+          ...advisory.result,
+          targetTokens: plan.advisoryTargetTokens,
+          fits: advisory.result.fits === true,
+        };
+      }
+    }
+    return preview;
   }
 
   /**
@@ -2521,6 +3836,75 @@ export class AgentFramework {
     this.store.setStateJson(FRAMEWORK_STATE_ID, state);
   }
 
+  /** Persist (or clear, with null) the host quiesce mode. First process-global
+   * key in the framework/state slot: quiesce survives a restart BY DESIGN — a
+   * crash mid-surgery must come back up NOT serving against a half-repaired
+   * store. Resume is always reachable (public method, WS/HTTP, control-plane
+   * host/command), and every quiesced boot logs a loud banner. */
+  private persistHostMode(mode: { quiesced: true; reason?: string; since: number } | null): void {
+    if (this.hostModePath) {
+      // Branch-independent: the recovery file is the record. (`quiesced:
+      // false` is written explicitly rather than deleting the file so that
+      // its presence, not its content, decides precedence over the legacy
+      // branch-local slot below.)
+      this.writeRecoveryFile(
+        this.hostModePath,
+        mode === null ? { version: 1, quiesced: false, clearedAt: Date.now() } : { version: 1, ...mode },
+      );
+      if (mode === null) {
+        // Also drop any legacy slot marker so a downgrade cannot resurrect it.
+        try {
+          const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+          if (data && typeof data === 'object' && 'hostMode' in (data as Record<string, unknown>)) {
+            const state = { ...(data as Record<string, unknown>) };
+            delete state.hostMode;
+            this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+          }
+        } catch { /* best effort */ }
+      }
+    } else {
+      this.warnRecoveryFallbackOnce();
+      const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+      const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+      if (mode === null) delete state.hostMode;
+      else state.hostMode = { ...mode };
+      this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+    }
+    // The whole feature rests on the flag surviving a crash — close the
+    // window between the write and the next periodic sync.
+    try {
+      this.store.sync();
+    } catch (err) {
+      console.error('[host-mode] store sync after host-mode change failed:', err);
+    }
+  }
+
+  /** The recovery file wins whenever it exists; the branch-local slot is
+   *  read only for stores that predate it (or store-only configs). */
+  private readHostMode(): { quiesced: boolean; reason?: string; since?: number } | null {
+    try {
+      let record: Record<string, unknown> | null = null;
+      if (this.hostModePath && existsSync(this.hostModePath)) {
+        const doc = this.readRecoveryFile(this.hostModePath);
+        if (doc && typeof doc === 'object') record = doc as Record<string, unknown>;
+      } else {
+        const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+        if (!data || typeof data !== 'object') return null;
+        const mode = (data as Record<string, unknown>).hostMode;
+        if (!mode || typeof mode !== 'object') return null;
+        record = mode as Record<string, unknown>;
+      }
+      if (!record) return null;
+      return {
+        quiesced: record.quiesced === true,
+        ...(typeof record.reason === 'string' ? { reason: record.reason } : {}),
+        ...(typeof record.since === 'number' ? { since: record.since } : {}),
+      };
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * Create an ephemeral agent that is NOT registered in the main event loop.
    *
@@ -2558,6 +3942,8 @@ export class AgentFramework {
       });
 
       const agent = new Agent(config, contextManager, this.membrane);
+    agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+      agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.ephemeralCandidates.set(agent, contextManager);
 
       const cleanup = () => {
@@ -2646,11 +4032,32 @@ export class AgentFramework {
     contextManager: ContextManager,
     watchdogs?: { startupTimeoutMs?: number; idleTimeoutMs?: number; idlePollMs?: number },
   ): Promise<{ speech: string; toolCallsCount: number }> {
+    // Refused at admission while quiesced rather than requeued: the caller
+    // awaits the settle promise under an idle-stall watchdog, so a gate-parked
+    // ephemeral would ride out its timeout and reject with a misleading
+    // "stalled" error hours later. A clear refusal now beats that. Checked
+    // before the generation ticket is consumed so the same (agent, cm) pair
+    // can be retried after resume().
+    if (this.quiesced) {
+      throw new Error(
+        `framework is quiesced${this.quiesceReason ? ` (${this.quiesceReason})` : ''}: ` +
+        `refusing new ephemeral run for ${agent.name} — resume() first`,
+      );
+    }
     // Only a fresh object returned by createEphemeralAgent may enter this path.
     // Never overwrite a resident/conversation owner or a concurrent run: their
     // cleanup is name-keyed and could cancel/deregister the legitimate owner.
     if (this.ephemeralCandidates.get(agent) !== contextManager) {
       throw new Error(`Ephemeral agent "${agent.name}" has no fresh generation ticket from this framework`);
+    }
+    // A live surgery holds the whole store: an agent admitted now would
+    // compile against a history that is being replaced under it. Refuse
+    // BEFORE consuming the ticket so the caller can retry once it completes.
+    if (this.surgeryHold) {
+      throw new Error(
+        `Ephemeral agent "${agent.name}" refused: the store is under live ${this.surgeryHold.verb} ` +
+          `for ${this.surgeryHold.agentName} — retry when it completes`,
+      );
     }
     // Consume before any await/registration: the exact (Agent, ContextManager)
     // generation is one-shot even if startup later fails.
@@ -2658,6 +4065,7 @@ export class AgentFramework {
     if (this.agents.has(agent.name) || this.ephemeralRuns.has(agent.name)) {
       throw new Error(`Ephemeral agent "${agent.name}" is already registered or running`);
     }
+    // Register temporarily so the event loop can drive it
     this.agents.set(agent.name, agent);
     const run: EphemeralRun = {
       settle: this.createDeferred<AgentSettleResult>(),
@@ -3403,6 +4811,8 @@ export class AgentFramework {
     /** Agent state at queue time — 'idle' means the turn starts on the next
      *  scheduler pass; anything else means it runs after the current turn. */
     agentStatus?: string;
+    /** True when the host is quiesced: the wake is PARKED, not running, until resume(). */
+    quiesced?: boolean;
   } {
     const name = agentName ?? [...this.agents.keys()][0];
     const agent = name ? this.agents.get(name) : undefined;
@@ -3418,8 +4828,17 @@ export class AgentFramework {
       source: 'admin',
       timestamp: Date.now(),
     });
-    console.error(`[nudge] agent=${name} queued by=${requestedBy ?? 'unknown'} status=${agentStatus}`);
-    return { ok: true, agentName: name, agentStatus };
+    console.error(
+      `[nudge] agent=${name} queued by=${requestedBy ?? 'unknown'} status=${agentStatus}` +
+      (this.quiesced ? ' (host quiesced — parked until resume)' : ''),
+    );
+    this.recordOperatorAction({
+      kind: 'nudge',
+      agent: name,
+      requester: { via: 'nudge', ...(requestedBy ? { name: requestedBy } : {}) },
+      result: { agentStatus, ...(this.quiesced ? { quiesced: true } : {}) },
+    });
+    return { ok: true, agentName: name, agentStatus, ...(this.quiesced ? { quiesced: true } : {}) };
   }
 
   /**
@@ -3433,6 +4852,20 @@ export class AgentFramework {
    *
    *   nudge — run inference on the current context with NO new events
    *   (see `nudgeAgent`).
+   *
+   *   quiesce — enter host maintenance mode (issue #122): park wakes, pause
+   *   MCPL data planes, drain in-flight turns (optionally `abandon` on
+   *   timeout). Host-scoped, no agentName.
+   *
+   *   resume — leave maintenance mode behind a fresh feasibility preview of
+   *   every agent's current settings (`force` overrides a failing verdict).
+   *
+   *   maintain — run (or join) one bounded compression/maintenance pass and
+   *   return the snapshot; the operator lever for draining quarantine or
+   *   advancing merges during a quiesce window.
+   *
+   *   host-status — report the quiesce state (drained / parked wakes /
+   *   running background scripts).
    */
   private async handleHostCommand(
     serverId: string,
@@ -3440,8 +4873,14 @@ export class AgentFramework {
   ): Promise<{
     ok: boolean;
     error?: string;
+    /** Refusal code from live surgery (e.g. 'agent-busy'), when applicable. */
+    code?: string;
     undone?: number;
     requested?: number;
+    /** For quiesce/resume/maintain/host-status: the host mode snapshot. */
+    hostMode?: HostModeStatus;
+    /** For `maintain`: the context-maintenance snapshot after the pass. */
+    maintenance?: ContextMaintenanceSnapshot;
     messagesRemoved?: number;
     /** Discord addresses removed by message-granular undo. The durable outbox
      *  owns eventual delivery; this is also returned for immediate surfaces. */
@@ -3455,6 +4894,9 @@ export class AgentFramework {
      *  outcome report is posted to the channel asynchronously. */
     started?: boolean;
     cap?: number;
+    /** For `nudge`/`unstick`: the host is quiesced, so the request is parked
+     *  until resume rather than running. */
+    quiesced?: boolean;
     /** For `nudge`: agent state at queue time ('idle' = runs immediately,
      *  else it runs once the current turn settles). */
     agentStatus?: string;
@@ -3463,9 +4905,46 @@ export class AgentFramework {
       params.command !== 'undo' &&
       params.command !== 'hide' &&
       params.command !== 'unstick' &&
-      params.command !== 'nudge'
+      params.command !== 'nudge' &&
+      params.command !== 'quiesce' &&
+      params.command !== 'resume' &&
+      params.command !== 'maintain' &&
+      params.command !== 'host-status'
     ) {
       return { ok: false, error: `Unknown host command: ${String(params.command)}` };
+    }
+
+    // Host-scoped verbs (issue #122) — no agent resolution.
+    const requester = params.requesterName ?? params.requesterId ?? `mcpl:${serverId}`;
+    if (params.command === 'quiesce') {
+      // quiesce() clamps timeoutMs to [1s, 10m] itself — one clamp for every ingress.
+      console.error(`[host-command] quiesce by=${requester} (server=${serverId})`);
+      const hostMode = await this.quiesce({
+        reason: params.reason ?? `host/command by ${requester}`,
+        ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
+        ...(params.abandon ? { abandon: true } : {}),
+      });
+      return { ok: true, hostMode };
+    }
+    if (params.command === 'resume') {
+      console.error(`[host-command] resume by=${requester} (server=${serverId})`);
+      try {
+        const hostMode = await this.resume(params.force ? { force: true } : undefined);
+        return { ok: true, hostMode };
+      } catch (error) {
+        if (error instanceof ResumeBlockedError) {
+          return { ok: false, error: error.message, hostMode: this.getHostModeStatus() };
+        }
+        throw error;
+      }
+    }
+    if (params.command === 'maintain') {
+      console.error(`[host-command] maintain by=${requester} (server=${serverId})`);
+      const maintenance = await this.maintenanceTick();
+      return { ok: true, maintenance, hostMode: this.getHostModeStatus() };
+    }
+    if (params.command === 'host-status') {
+      return { ok: true, hostMode: this.getHostModeStatus() };
     }
 
     const agentName = params.agentName ?? [...this.agents.keys()][0];
@@ -3480,7 +4959,7 @@ export class AgentFramework {
         agentName,
         params.requesterName ?? params.requesterId ?? `mcpl:${serverId}`,
       );
-      return { ok: r.ok, error: r.error, agentStatus: r.agentStatus };
+      return { ok: r.ok, error: r.error, agentStatus: r.agentStatus, ...(r.quiesced ? { quiesced: true } : {}) };
     }
 
     // unstick: force the refusal-rewind loop on demand (even if the agent's
@@ -3512,7 +4991,14 @@ export class AgentFramework {
         `[unstick] agent=${agentName} started cap=${cap} ` +
           `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
       );
-      return { ok: true, started: true, cap };
+      this.recordOperatorAction({
+        kind: 'unstick',
+        agent: agentName,
+        requester: hostCommandRequester(serverId, params),
+        params: { cap },
+        result: { started: true, ...(this.quiesced ? { quiesced: true } : {}) },
+      });
+      return { ok: true, started: true, cap, ...(this.quiesced ? { quiesced: true } : {}) };
     }
 
     // hide: redact a single message (or an inclusive range) from the active
@@ -3562,11 +5048,25 @@ export class AgentFramework {
           }
           const [lo, hi] = fromIdx <= toIdx ? [fromIdx, toIdx] : [toIdx, fromIdx];
           const refs = refsIn(lo, hi);
+          const rangeIds = all.slice(lo, hi + 1).map((m) => String(m.id));
           cm.removeMessages(all[lo].id, all[hi].id);
           console.error(
             `[host-command] hide agent=${agentName} range removed=${hi - lo + 1} ` +
               `(${params.fromMessageId}..${params.toMessageId}) by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
           );
+          const loggedRange = capIds(rangeIds);
+          this.recordOperatorAction({
+            kind: 'hide',
+            agent: agentName,
+            requester: hostCommandRequester(serverId, params),
+            params: { fromMessageId: params.fromMessageId, toMessageId: params.toMessageId },
+            result: {
+              branch: this.store.currentBranch().name,
+              hidden: hi - lo + 1,
+              removedIds: loggedRange.ids,
+              ...(loggedRange.truncated ? { removedIdsTruncated: true } : {}),
+            },
+          });
           return {
             ok: true,
             hidden: hi - lo + 1,
@@ -3575,11 +5075,19 @@ export class AgentFramework {
           };
         }
         const refs = refsIn(fromIdx, fromIdx);
+        const hiddenId = String(all[fromIdx].id);
         cm.removeMessage(all[fromIdx].id);
         console.error(
           `[host-command] hide agent=${agentName} removed=1 (${params.fromMessageId}) ` +
             `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
         );
+        this.recordOperatorAction({
+          kind: 'hide',
+          agent: agentName,
+          requester: hostCommandRequester(serverId, params),
+          params: { fromMessageId: params.fromMessageId },
+          result: { branch: this.store.currentBranch().name, hidden: 1, removedIds: [hiddenId] },
+        });
         return {
           ok: true,
           hidden: 1,
@@ -3602,62 +5110,40 @@ export class AgentFramework {
       }
       const n = Math.max(1, Math.min(50, Math.floor(params.messages)));
       const cm = agent.getContextManager();
-      const allMessages = cm.getAllMessages();
-      if (n >= allMessages.length) {
+      const total = cm.getMessageCount();
+      if (n >= total) {
         return {
           ok: false,
-          error: `Cannot remove ${n} message(s) — history has ${allMessages.length}; at least one must remain.`,
+          error: `Cannot remove ${n} message(s) — history has ${total}; at least one must remain.`,
         };
       }
-      const target = allMessages[allMessages.length - 1 - n];
-      const discarded = allMessages.slice(allMessages.length - n);
-      const removedRefs = extractDiscordAwarenessRefs(discarded);
-      const sourceBranch = this.store.currentBranch().name;
-      const targetBranch = `undo-msgs/${agentName}/${Date.now()}`;
-
-      // Prepare the external side effect before switching Chronicle. If the
-      // process dies after the switch but before activate(), startup promotes
-      // this batch by matching targetBranch to the active branch.
-      const markerBatch = this.discordAwarenessOutbox?.prepare({
-        agentName,
-        sourceBranch,
-        targetBranch,
-        refs: removedRefs,
-        emoji: this.discordAwarenessEmoji,
-      }) ?? null;
-
-      const branchName = cm.branchAt(target.id, targetBranch);
-      await cm.switchBranch(branchName);
-      if (markerBatch) this.discordAwarenessOutbox!.activate(markerBatch.id);
-      await this.syncDiscordAwarenessMarkers();
-
-      // Materialize config files from the new branch (fire-and-forget; gate
-      // picks up via mtime) — mirrors undoLastTurn.
-      const wsUndo = this.moduleRegistry.getModule('workspace');
-      if (wsUndo && 'materializeMount' in wsUndo) {
-        (wsUndo as { materializeMount: (m: string) => Promise<void> })
-          .materializeMount('_config')
-          .catch(() => {});
+      const target = cm.getMessageWindow(total - 1 - n, 1, { resolveBlobs: false }).messages[0];
+      try {
+        const r = await this.rollbackToMessage(agentName, {
+          messageId: String(target.id),
+          branchName: `undo-msgs/${agentName}/${Date.now()}`,
+          requester: hostCommandRequester(serverId, params),
+        });
+        return {
+          ok: true,
+          messagesRemoved: r.messagesRemoved,
+          removedRefs: r.removedRefs,
+          lastVisible: r.lastVisible,
+        };
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+          ...(error instanceof OperatorActionError ? { code: error.code } : {}),
+        };
       }
-
-      console.error(
-        `[host-command] undo-messages agent=${agentName} removed=${n} branch=${branchName}` +
-          ` by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
-      );
-
-      return {
-        ok: true,
-        messagesRemoved: n,
-        removedRefs,
-        lastVisible: await this.lastVisiblePreview(agentName),
-      };
     }
 
     const requested = Math.max(1, Math.min(20, Math.floor(params.turns ?? 1)));
     let undone = 0;
     try {
       for (let i = 0; i < requested; i++) {
-        const r = this.undoLastTurn(agentName);
+        const r = this.undoLastTurn(agentName, hostCommandRequester(serverId, params));
         if (!r.undone) break;
         undone++;
       }
@@ -3995,7 +5481,7 @@ export class AgentFramework {
    * The undone branch is saved so `redo()` can restore it.
    * Returns the checkpoint that was undone, or null if nothing to undo.
    */
-  undoLastTurn(agentName: string): {
+  undoLastTurn(agentName: string, requester?: OperatorRequester): {
     undone: boolean;
     turnIndex?: number;
     fromBranch?: string;
@@ -4044,6 +5530,13 @@ export class AgentFramework {
       fromBranch: currentBranch.name,
       toBranch: undoBranchName,
     });
+    this.recordOperatorAction({
+      kind: 'undo-turn',
+      agent: agentName,
+      ...(requester ? { requester } : {}),
+      params: { turnIndex: checkpoint.turnIndex },
+      result: { sourceBranch: currentBranch.name, targetBranch: undoBranchName },
+    });
 
     return {
       undone: true,
@@ -4059,7 +5552,7 @@ export class AgentFramework {
    * Switches back to the branch that was active before the last undo.
    * Returns false if there's nothing to redo.
    */
-  redo(agentName: string): {
+  redo(agentName: string, requester?: OperatorRequester): {
     redone: boolean;
     fromBranch?: string;
     toBranch?: string;
@@ -4099,12 +5592,484 @@ export class AgentFramework {
       fromBranch: currentBranch.name,
       toBranch: branchName,
     });
+    this.recordOperatorAction({
+      kind: 'redo-turn',
+      agent: agentName,
+      ...(requester ? { requester } : {}),
+      result: { sourceBranch: currentBranch.name, targetBranch: branchName },
+    });
 
     return {
       redone: true,
       fromBranch: currentBranch.name,
       toBranch: branchName,
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Live operator surgery — rollback / suppress on the OPEN store, without a
+  // restart — plus the durable action log every operator mutation writes to.
+  //
+  // Both follow the same idiom the offline surgeries use (recovery/
+  // offline-branch.ts): fork first, mutate the fork, and make the fork the
+  // active branch. The parent branch keeps everything, so restore is a
+  // checkout. Mutations are refused (never queued) while the agent is not
+  // idle — quiesce the host first if it is busy.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Append a record to the operator action log and broadcast it as an
+   * `operator:action` trace. Hosts use this directly for actions the
+   * framework does not own (e.g. a WebUI toggling quiesce). Never throws.
+   */
+  recordOperatorAction(input: OperatorLogInput): OperatorLogEntry {
+    // Observability never fails the action: OperatorLog.append never throws,
+    // and a misbehaving trace listener is contained here.
+    const entry = this.operatorLog.append(input);
+    try {
+      this.emitTrace({
+        type: 'operator:action',
+        kind: entry.kind,
+        ...(entry.agent !== undefined ? { agentName: entry.agent } : {}),
+        ...(entry.requester !== undefined ? { requester: entry.requester } : {}),
+        ...(entry.note !== undefined ? { note: entry.note } : {}),
+        ...(entry.params !== undefined ? { params: entry.params } : {}),
+        ...(entry.result !== undefined ? { result: entry.result } : {}),
+        ...(entry.error !== undefined ? { error: entry.error } : {}),
+      });
+    } catch {
+      // swallowed by design
+    }
+    return entry;
+  }
+
+  /** Newest `limit` operator-log entries, oldest first. */
+  getOperatorLog(opts?: { limit?: number }): OperatorLogEntry[] {
+    return this.operatorLog.readTail(opts?.limit ?? 100);
+  }
+
+  /** Where the operator log is written, or undefined when disabled. */
+  getOperatorLogPath(): string | undefined {
+    return this.operatorLog.path;
+  }
+
+  /**
+   * The surgery gate — STORE-wide, not per agent. A branch switch moves the
+   * active chronicle branch for every context manager sharing this store,
+   * so an in-flight turn on *any* agent would have its next writes land on
+   * a history its request was never compiled against. Every agent must be
+   * idle with no turn alive (`state.status === 'idle'` alone is not enough:
+   * status reads idle from dequeue until the stream registers and again
+   * during teardown — the scheduler's own busy test is status + turn-alive,
+   * the predicate `puppetToolCall` uses).
+   *
+   * Passing the gate RESERVES the store for the caller: a turn token is
+   * held for every agent until the returned release runs, so no wake — via
+   * the scheduler or a parked provider admission, both of which re-test
+   * turn-alive — can start a turn while the switch is awaited. Release also
+   * flushes messages that deferred behind the reservation, as the puppet
+   * does. Always release in `finally`: a token nobody clears wedges the fleet.
+   */
+  private reserveStoreForSurgery(verb: string, agentName: string): () => void {
+    if (this.surgeryHold) {
+      throw new OperatorActionError(
+        'agent-busy',
+        `Cannot ${verb}: a live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName} is already in progress`,
+      );
+    }
+    const busy: string[] = [];
+    for (const [name, a] of this.agents) {
+      if (a.state.status !== 'idle') busy.push(`${name} is ${a.state.status}`);
+      else if (this.activeTurnTokens.has(name)) busy.push(`${name} is idle+turn-alive`);
+    }
+    for (const name of this.activeTurnTokens.keys()) {
+      if (!this.agents.has(name)) busy.push(`${name} is turn-alive`);
+    }
+    if (busy.length > 0) {
+      throw new OperatorActionError(
+        'agent-busy',
+        `Cannot ${verb} while ${busy.join(', ')} — every agent sharing the store must be idle (quiesce the host first)`,
+      );
+    }
+    const reserved = new Map<string, number>();
+    for (const name of this.agents.keys()) {
+      const token = this.nextTurnToken++;
+      this.activeTurnTokens.set(name, token);
+      reserved.set(name, token);
+    }
+    // The token snapshot only covers agents that exist now; the hold covers
+    // arrivals during the awaited switch (see surgeryHold).
+    const hold = { verb, agentName, since: Date.now() };
+    this.surgeryHold = hold;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      if (this.surgeryHold === hold) this.surgeryHold = null;
+      for (const [name, token] of reserved) {
+        if (this.activeTurnTokens.get(name) === token) this.activeTurnTokens.delete(name);
+      }
+      // Writers that deferred behind the reservation land now, on the branch
+      // the operator chose (or the restored source) — the same end-of-turn
+      // flush driveStream/puppet perform, under the same guard.
+      if (this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
+        for (const name of reserved.keys()) {
+          if (this.activeTurnTokens.has(name)) continue;
+          for (const msg of this.drainDeferredFor(name)) {
+            try {
+              this.addMessage(msg.participant, msg.content, msg.metadata,
+                msg.forAgent ? { forAgent: msg.forAgent } : undefined);
+            } catch (error) {
+              console.error(`[operator] post-surgery deferred flush failed for ${name}: ${error instanceof Error ? error.message : String(error)}`);
+            }
+          }
+        }
+      }
+    };
+  }
+
+  /**
+   * After a failed switch or redaction: put the store back on `sourceBranch`
+   * if it moved, and return a sentence saying what actually happened. Never
+   * throws — the caller reports the original failure with this appended.
+   */
+  private async restoreSourceBranch(
+    cm: ContextManager,
+    sourceBranch: string,
+    failedBranch: string,
+    agentName: string,
+  ): Promise<string> {
+    const current = this.store.currentBranch().name;
+    if (current !== failedBranch) return `active branch is ${current}`;
+    try {
+      await cm.switchBranch(sourceBranch);
+      return `active branch restored to ${sourceBranch}`;
+    } catch (restoreError) {
+      const detail = restoreError instanceof Error ? restoreError.message : String(restoreError);
+      const status = `RESTORE TO ${sourceBranch} ALSO FAILED (${detail}); agent is still on ${failedBranch}`;
+      console.error(`[operator] agent=${agentName} ${status}`);
+      return status;
+    }
+  }
+
+  /**
+   * Roll the active branch back so `messageId` becomes its tail: fork the
+   * chronicle at that message (origin-sequence time-travel branch) and switch
+   * to the fork. Everything after the message stays on the source branch.
+   * Discord messages that left the live context get awareness markers via the
+   * durable outbox, exactly as message-granular `undo` does.
+   *
+   * Throws `OperatorActionError` (`agent-busy`, `unknown-message`, …) — the
+   * agent must be idle; nothing is queued.
+   */
+  async rollbackToMessage(
+    agentName: string,
+    opts: {
+      messageId: string;
+      requester?: OperatorRequester;
+      note?: string;
+      /** Branch name for the fork (default `rollback/<agent>/<ts>`). */
+      branchName?: string;
+    },
+  ): Promise<{
+    agentName: string;
+    sourceBranch: string;
+    targetBranch: string;
+    messagesRemoved: number;
+    /** The message that actually became the tail. Differs from the requested
+     *  id only when that id was a shard of a body group: the fork lands on
+     *  the group's last shard so the sharded message stays whole. */
+    tailMessageId: string;
+    removedRefs: Array<{ serverId: string; channelId: string; messageId: string }>;
+    lastVisible: { participant?: string; role?: string; preview?: string } | null;
+  }> {
+    const logBase: OperatorLogInput = {
+      kind: 'rollback',
+      agent: agentName,
+      ...(opts.requester ? { requester: opts.requester } : {}),
+      ...(opts.note ? { note: opts.note } : {}),
+      params: { messageId: opts.messageId },
+    };
+    try {
+      const agent = this.agents.get(agentName);
+      if (!agent) throw new OperatorActionError('unknown-agent', `Unknown agent: ${agentName}`);
+      const cm = agent.getContextManager();
+      const total = cm.getMessageCount();
+      const requestedIndex = locateMessageIndex(cm, opts.messageId);
+      if (requestedIndex < 0) {
+        throw new OperatorActionError('unknown-message', `Message ${opts.messageId} is not on the active branch`);
+      }
+      // Never bisect a body group: chronicle refuses that for removals
+      // (byte-faithful reassembly needs the whole run) and branchAt has no
+      // such guard of its own. Snap to the run's last shard.
+      const run = bodyGroupRun(cm, requestedIndex);
+      const targetIndex = run.to;
+      const tailMessageId = run.toId;
+      const messagesRemoved = total - targetIndex - 1;
+      if (messagesRemoved <= 0) {
+        throw new OperatorActionError('invalid', `Message ${opts.messageId} is already the tail of the active branch`);
+      }
+      const discarded = cm.getMessageWindow(targetIndex + 1, messagesRemoved, { resolveBlobs: false }).messages;
+      const removedRefs = extractDiscordAwarenessRefs(discarded);
+      const sourceBranch = this.store.currentBranch().name;
+      const targetBranch = opts.branchName ?? `rollback/${agentName}/${Date.now()}`;
+      if (targetBranch === sourceBranch) {
+        throw new OperatorActionError('invalid', 'Rollback branch name must differ from the active branch');
+      }
+
+      // Gate + reserve the whole store (see reserveStoreForSurgery); held
+      // until the switch has landed or been rolled back.
+      const release = this.reserveStoreForSurgery('roll back', agentName);
+      let branchName: string;
+      try {
+        // Prepare the external side effect before switching Chronicle. If the
+        // process dies after the switch but before activate(), startup
+        // promotes this batch by matching targetBranch to the active branch.
+        // If the fork/switch itself throws, the batch is retired so it cannot
+        // arm a later branch that happens to reuse the name.
+        const markerBatch = this.discordAwarenessOutbox?.prepare({
+          agentName,
+          sourceBranch,
+          targetBranch,
+          refs: removedRefs,
+          emoji: this.discordAwarenessEmoji,
+        }) ?? null;
+
+        try {
+          branchName = cm.branchAt(tailMessageId as MessageId, targetBranch);
+          await cm.switchBranch(branchName);
+        } catch (error) {
+          // switchBranch moves the chronicle branch BEFORE awaiting strategy
+          // initialization, so a rejection here can leave the store on the
+          // new branch with an uninitialized strategy. Retire the batch and
+          // go back to the source; keep the branch for diagnosis.
+          if (markerBatch) this.discordAwarenessOutbox!.discard(markerBatch.id);
+          const restored = await this.restoreSourceBranch(cm, sourceBranch, targetBranch, agentName);
+          throw new OperatorActionError(
+            'failed',
+            `Rollback failed; ${restored}: ${error instanceof Error ? error.message : String(error)}`,
+            { cause: error },
+          );
+        }
+        if (markerBatch) this.discordAwarenessOutbox!.activate(markerBatch.id);
+        await this.syncDiscordAwarenessMarkers();
+        this.materializeConfigMountAfterBranchSwitch();
+      } finally {
+        release();
+      }
+
+      console.error(
+        `[operator] rollback agent=${agentName} to=${tailMessageId}` +
+          `${tailMessageId !== opts.messageId ? ` (requested ${opts.messageId}, snapped to end of body group)` : ''}` +
+          ` removed=${messagesRemoved} branch=${branchName} by=${describeRequester(opts.requester)}`,
+      );
+      this.recordOperatorAction({
+        ...logBase,
+        result: {
+          sourceBranch,
+          targetBranch: branchName,
+          tailMessageId,
+          messagesRemoved,
+          discordRefs: removedRefs.length,
+        },
+      });
+      return {
+        agentName,
+        sourceBranch,
+        targetBranch: branchName,
+        messagesRemoved,
+        tailMessageId,
+        removedRefs,
+        lastVisible: await this.lastVisiblePreview(agentName),
+      };
+    } catch (error) {
+      this.recordOperatorAction({ ...logBase, error: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+  }
+
+  /**
+   * Suppress specific messages from the live context without touching the
+   * source branch: fork at the current head (`suppress/<agent>/<ts>`), redact
+   * the messages on the fork, switch to it. Shards of a body group are always
+   * removed together. Discord originals get awareness markers via the outbox;
+   * the batch is `explicit`-activated only after every removal succeeded, and
+   * a crash mid-way is finished at next boot (resumePreparedDiscordSuppressions).
+   *
+   * Not retroactive over derived state: a message already folded into an
+   * autobiographical summary stays in that summary — roll back to before it
+   * entered if that matters.
+   */
+  async suppressMessages(
+    agentName: string,
+    opts: {
+      messageIds: string[];
+      requester?: OperatorRequester;
+      note?: string;
+      /** Branch name for the fork (default `suppress/<agent>/<ts>`). */
+      branchName?: string;
+    },
+  ): Promise<{
+    agentName: string;
+    sourceBranch: string;
+    targetBranch: string;
+    messagesRemoved: number;
+    removedIds: string[];
+    removedRefs: Array<{ serverId: string; channelId: string; messageId: string }>;
+    lastVisible: { participant?: string; role?: string; preview?: string } | null;
+  }> {
+    const requestedIds = [...new Set(opts.messageIds.map(String))];
+    const logBase: OperatorLogInput = {
+      kind: 'suppress',
+      agent: agentName,
+      ...(opts.requester ? { requester: opts.requester } : {}),
+      ...(opts.note ? { note: opts.note } : {}),
+      params: { messageIds: requestedIds },
+    };
+    try {
+      const agent = this.agents.get(agentName);
+      if (!agent) throw new OperatorActionError('unknown-agent', `Unknown agent: ${agentName}`);
+      if (requestedIds.length === 0) throw new OperatorActionError('invalid', 'No message ids given');
+      const cm = agent.getContextManager();
+      const total = cm.getMessageCount();
+
+      const located = locateMessageIndices(cm, new Set(requestedIds));
+      const missing = requestedIds.filter((id) => !located.has(id));
+      if (missing.length > 0) {
+        throw new OperatorActionError(
+          'unknown-message',
+          `Not on the active branch: ${missing.slice(0, 5).join(', ')}${missing.length > 5 ? ` (+${missing.length - 5})` : ''}`,
+        );
+      }
+
+      // Build removal intervals (index-ordered, newest first). A shard expands
+      // to its whole body group — chronicle refuses to bisect one — and a
+      // group interval is always removed as a RANGE: `removeMessage` refuses
+      // any sharded message even when the group is down to one shard.
+      const intervals = new Map<string, ReturnType<typeof bodyGroupRun>>();
+      for (const id of requestedIds) {
+        const run = bodyGroupRun(cm, located.get(id)!.index);
+        intervals.set(`${run.from}-${run.to}`, run);
+      }
+      const ordered = [...intervals.values()].sort((a, b) => b.from - a.from);
+      const messagesRemoved = ordered.reduce((n, iv) => n + (iv.to - iv.from + 1), 0);
+      if (messagesRemoved >= total) {
+        throw new OperatorActionError('invalid', `Cannot suppress all ${total} message(s) — at least one must remain`);
+      }
+      const targeted = ordered.flatMap((iv) =>
+        cm.getMessageWindow(iv.from, iv.to - iv.from + 1, { resolveBlobs: false }).messages,
+      );
+      const removedIds = targeted.map((m) => String(m.id));
+      const removedRefs = extractDiscordAwarenessRefs(targeted);
+
+      const sourceBranch = this.store.currentBranch().name;
+      const targetBranch = opts.branchName ?? `suppress/${agentName}/${Date.now()}`;
+      if (targetBranch === sourceBranch) {
+        throw new OperatorActionError('invalid', 'Suppression branch name must differ from the active branch');
+      }
+      // Gate + reserve the whole store (see reserveStoreForSurgery); held
+      // until the fork is fully redacted or the source is restored.
+      const release = this.reserveStoreForSurgery('suppress', agentName);
+      let createdBranch: string;
+      try {
+        const markerBatch = this.discordAwarenessOutbox?.prepare({
+          agentName,
+          sourceBranch,
+          targetBranch,
+          refs: removedRefs,
+          emoji: this.discordAwarenessEmoji,
+          // Seeing targetBranch active does not prove the removals finished;
+          // only this operation activates the batch, after the last redaction.
+          activationPolicy: 'explicit',
+          suppressionIntervals: ordered.map((iv) => ({ fromId: iv.fromId, toId: iv.toId })),
+        }) ?? null;
+        // Anything short of activation retires the batch: a prepared explicit
+        // batch re-arms through preparedSuppressionsForBranch the moment its
+        // target branch (or a descendant) becomes active — e.g. an operator
+        // opening the failed fork to look — and an un-completable resume
+        // there aborts framework start.
+        const retireBatch = (): void => {
+          if (markerBatch) this.discordAwarenessOutbox!.discard(markerBatch.id);
+        };
+
+        try {
+          createdBranch = await cm.fork(targetBranch);
+        } catch (error) {
+          // fork() switches the chronicle branch before awaiting strategy
+          // initialization; a rejection can leave the store on the new
+          // branch. Retire the batch and go back to the source.
+          retireBatch();
+          const restored = await this.restoreSourceBranch(cm, sourceBranch, targetBranch, agentName);
+          throw new OperatorActionError(
+            'failed',
+            `Suppression failed creating ${targetBranch}; ${restored}: ${error instanceof Error ? error.message : String(error)}`,
+            { cause: error },
+          );
+        }
+        try {
+          for (const iv of ordered) {
+            if (iv.group || iv.fromId !== iv.toId) cm.removeMessages(iv.fromId as MessageId, iv.toId as MessageId);
+            else cm.removeMessage(iv.fromId as MessageId);
+          }
+          if (markerBatch) this.discordAwarenessOutbox!.activate(markerBatch.id);
+        } catch (error) {
+          // A partially suppressed branch is not safe to serve from. Keep it
+          // for diagnosis, put the agent back on the untouched source — and
+          // say honestly whether that restore happened.
+          retireBatch();
+          const restored = await this.restoreSourceBranch(cm, sourceBranch, createdBranch, agentName);
+          throw new OperatorActionError(
+            'failed',
+            `Suppression failed on ${createdBranch}; ${restored}: ${error instanceof Error ? error.message : String(error)}`,
+            { cause: error },
+          );
+        }
+        await this.syncDiscordAwarenessMarkers();
+        this.materializeConfigMountAfterBranchSwitch();
+      } finally {
+        release();
+      }
+
+      console.error(
+        `[operator] suppress agent=${agentName} removed=${messagesRemoved} branch=${createdBranch} ` +
+          `by=${describeRequester(opts.requester)}`,
+      );
+      const loggedIds = capIds(removedIds);
+      this.recordOperatorAction({
+        ...logBase,
+        result: {
+          sourceBranch,
+          targetBranch: createdBranch,
+          messagesRemoved,
+          removedIds: loggedIds.ids,
+          ...(loggedIds.truncated ? { removedIdsTruncated: true } : {}),
+          discordRefs: removedRefs.length,
+        },
+      });
+      return {
+        agentName,
+        sourceBranch,
+        targetBranch: createdBranch,
+        messagesRemoved,
+        removedIds,
+        removedRefs,
+        lastVisible: await this.lastVisiblePreview(agentName),
+      };
+    } catch (error) {
+      this.recordOperatorAction({ ...logBase, error: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+  }
+
+  /** Re-materialize config files from the (new) active branch — fire and
+   *  forget; the gate picks changes up via mtime. Mirrors undoLastTurn. */
+  private materializeConfigMountAfterBranchSwitch(): void {
+    const ws = this.moduleRegistry.getModule('workspace');
+    if (ws && 'materializeMount' in ws) {
+      (ws as { materializeMount: (m: string) => Promise<void> })
+        .materializeMount('_config')
+        .catch(() => {});
+    }
   }
 
   /**
@@ -4249,7 +6214,12 @@ export class AgentFramework {
       !this.queue.isEmpty ||
       // Direct inference requests (e.g. runEphemeralToCompletion) bypass the
       // event queue — without this the loop can exit before they're drained.
-      this.pendingRequests.length > 0 ||
+      // While quiesced, gate-parked requests are NOT progress and must not
+      // block idle (only a budget restart can still run); identity-equivalent
+      // to `.length > 0` when not quiesced.
+      this.pendingRequests.some(
+        (r) => !this.quiesced || isTurnContinuation(r.reason),
+      ) ||
       this.activeStreams.size > 0 ||
       Array.from(this.agents.values()).some((a) => a.state.status !== 'idle')
     ) {
@@ -4279,6 +6249,8 @@ export class AgentFramework {
     });
 
     const agent = new Agent(config, contextManager, this.membrane);
+    agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+    this.sharedSlotAgents.add(agent);
     const restoredSettings = this.readAgentRuntimeSettings(config.name);
     if (restoredSettings) {
       agent.restoreRuntimeSettings(
@@ -4353,6 +6325,8 @@ export class AgentFramework {
       allowedTools: [...SUBCONSCIOUS_TOOL_NAMES, 'think', 'skip_reply', 'end_turn'],
     };
     const agent = new Agent(agentConfig, contextManager, this.membrane);
+    agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+    this.sharedSlotAgents.add(agent); // reads the shared slot through its merged view
     this.agents.set(name, agent);
     this.agentConfigs.set(name, agentConfig);
     this.subconsciousAgentName = name;
@@ -4424,6 +6398,10 @@ export class AgentFramework {
         scriptWaiter(event.result);
         return;
       }
+
+      // RFC-007: the call's terminal (completed / failed) — the result
+      // itself is never sent, only whether it was an error.
+      this.toolLifecycleEmitter?.onResult(event.agentName, event.callId, event.result);
 
       const agent = this.agents.get(event.agentName);
       if (agent) {
@@ -4503,7 +6481,7 @@ export class AgentFramework {
             const deferred = this.drainDeferredFor(agent.name);
             if (deferred.length > 0) {
               for (const msg of deferred) {
-                agent.getContextManager().addMessage(msg.participant, msg.content, msg.metadata);
+                agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
                 // Injection guards: tool blocks would corrupt the tool-cycle
                 // structure the membrane enforces, and a message named as the
                 // agent itself would render as an ASSISTANT turn on the wire
@@ -4522,6 +6500,10 @@ export class AgentFramework {
               }
             }
           }
+
+          // Deferred writes handed to the store above: sync, then drop them
+          // from the durable recovery queue (no-op unless one is persisted).
+          this.ackDeferredWrites();
 
           // A newly injected CONVERSATIONAL message begins a new
           // conversational round inside the same provider inference. Remember
@@ -4715,6 +6697,11 @@ export class AgentFramework {
               membraneResults,
               midTurnInjections.length > 0 ? { injectedMessages: midTurnInjections } : undefined,
             );
+            // This continuation receives these exact notifications. Merely
+            // writing them to context above is insufficient: endTurn and
+            // budget restarts still need their queued wake. Only acknowledge
+            // after the stream accepts the injection, never before.
+            this.consumeInjectedScriptWakes(agent.name, midTurnInjections);
             agent.setStreaming(currentState.stream);
             this.emitTrace({
               type: 'inference:stream_resumed',
@@ -4754,6 +6741,17 @@ export class AgentFramework {
       this.handleMcplPushEvent(event as unknown as McplPushEvent);
     }
 
+    await this.dispatchProcessEventToModules(event, startTime);
+  }
+
+  /**
+   * The module half of handleProcessEvent: every module's onProcess, their
+   * responses, the tool-call dispatch, the completion trace and the process
+   * log. Shared with RFC-006 coalesced deliveries, which bypass the queue
+   * (the coalescer needs the placement synchronously) but must still reach
+   * modules exactly like the ordinary deliveries do.
+   */
+  private async dispatchProcessEventToModules(event: ProcessEvent, startTime = Date.now()): Promise<void> {
     // Dispatch to all modules, tracking responses with module names
     const responses: ModuleProcessResponse[] = [];
     for (const module of this.moduleRegistry.getAllModules()) {
@@ -4877,9 +6875,16 @@ export class AgentFramework {
     tags?: string[];
     triggerInference?: boolean;
     targetAgents?: string[];
-  }): Promise<void> {
+    /** RFC-006: set when the coalescer delivers; rides the wake it queues. */
+    coalescingSubject?: string;
+    eventId?: string;
+    assemblingFor?: string;
+    deliverTo?: string;
+  }): Promise<CoalescingPlacement | undefined> {
     const metadata: Record<string, unknown> = {
       ...event.metadata,
+      ...(event.eventId ? { eventId: event.eventId } : {}),
+      ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
       channelId: event.channelId,
       messageId: event.messageId,
       author: event.author,
@@ -4892,9 +6897,31 @@ export class AgentFramework {
     // Per-channel conversation routing: messages go to the channel's fork
     // agent (spawned from the template on first qualifying message), never
     // to the primary conversation.
-    if (this.conversationRouter) {
-      await this.routeConversationIncoming(event, metadata);
-      return;
+    // RFC-006 §3.2: a replacement or deletion notice follows the delivery it
+    // corrects — into the agent that holds (or read) the prior occurrence,
+    // never a context fresh routing would pick. Gone agent → delivered nowhere.
+    if (event.deliverTo) {
+      const target = this.agents.get(event.deliverTo);
+      if (!target) return undefined;
+      if (this.conversationRouter && this.conversationAgentHomes.has(target.name)) {
+        metadata.triggered = event.triggerInference ?? false;
+        const id = target.getContextManager().addMessage('user', event.content, metadata);
+        this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
+        if (event.triggerInference) {
+          this.pendingRequests.push({
+            agentName: target.name, reason: 'mcpl:channel-incoming', source: event.serverId, timestamp: Date.now(),
+            channelId: event.channelId,
+            counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
+            addressed: isAddressedMessage(event.tags, event.metadata),
+            ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
+          });
+        }
+        return { agent: target.name, messageId: id };
+      }
+      if (this.conversationRouter) return undefined; // the trunk never holds channel traffic
+      event = { ...event, targetAgents: [target.name] };
+    } else if (this.conversationRouter) {
+      return this.routeConversationIncoming(event, metadata);
     }
 
     // Addressed-while-closed invitation — parity with the push-event path
@@ -4941,7 +6968,8 @@ export class AgentFramework {
       metadata.tuneOut = { epochId: divert.epochId };
     }
 
-    const id = this.addMessage('user', incomingContent, metadata);
+    const placement: CoalescingPlacement = { agent: '' };
+    const id = this.addMessage('user', incomingContent, metadata, { placement, bypassDeferralFor: event.assemblingFor });
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
 
     if (event.triggerInference && !divert) {
@@ -4967,9 +6995,11 @@ export class AgentFramework {
           // Addressed messages outrank ambient chatter when a batched wake
           // picks the turn's frozen speech locus.
           addressed,
+          ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
         });
       }
     }
+    return placement.agent ? placement : undefined;
   }
 
   /**
@@ -4988,9 +7018,10 @@ export class AgentFramework {
       metadata?: Record<string, unknown>;
       tags?: string[];
       triggerInference?: boolean;
+      coalescingSubject?: string;
     },
     messageMetadata: Record<string, unknown>,
-  ): Promise<void> {
+  ): Promise<CoalescingPlacement | undefined> {
     const router = this.conversationRouter!;
     const descriptor = this.channelRegistry?.getDescriptor(event.channelId);
 
@@ -5067,8 +7098,10 @@ export class AgentFramework {
         channelId: event.channelId,
         counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
         addressed: isAddressedMessage(event.tags, event.metadata),
+        ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
       });
     }
+    return { agent: agent.name, messageId: id };
   }
 
   /**
@@ -5121,6 +7154,8 @@ export class AgentFramework {
 
       const config: AgentConfig = { ...templateConfig, name, strategy: undefined };
       const agent = new Agent(config, contextManager, this.membrane);
+    agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+      agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.agents.set(name, agent);
       this.agentConfigs.set(name, config);
       this.conversationAgentHomes.set(name, channelId);
@@ -5336,10 +7371,454 @@ export class AgentFramework {
     };
   }
 
+  // ==========================================================================
+  // RFC-006 event coalescing (see mcpl/push-coalescer.ts for the design)
+  // ==========================================================================
+
+  /**
+   * RFC-006 §3.2 binding identity: the configured server id bound to its
+   * endpoint/command. Survives reconnects to the same peer; changes when the
+   * id is reassigned to another endpoint (restartMcplServer with a new config).
+   */
+  private coalescingBinding(serverId: string): string {
+    const config = this.mcplServerConfigs.get(serverId);
+    return createHash('sha256').update(JSON.stringify([serverId, config?.url ?? null, config?.command ?? null, config?.args ?? null])).digest('hex').slice(0, 16);
+  }
+
+  private initializePushCoalescer(): void {
+    const coalescer = new PushCoalescer<CoalescedDelivery>({
+      isUnread: (p) => this.isUnreadPlacement(p),
+      remove: (p) => this.removePlacement(p),
+      deliver: (occ, materialized, assemblingFor) => this.deliverCoalesced(occ, materialized, assemblingFor),
+      wakeForBatch: (occ) => this.wakeForCoalescedBatch(occ),
+      cancelWake: (subject) => this.cancelCoalescedWakes(subject),
+      authorized: (occ) => this.coalescedAuthorized(occ),
+      audience: (occ) => this.coalescedAudience(occ),
+      render: (occ, params) => {
+        const server = this.mcplServerRegistry?.getServer(occ.serverId);
+        if (!server?.isConnected) throw new Error('server disconnected');
+        return server.sendPushRender(params);
+      },
+      audit: (record) => this.emitTrace({ type: 'mcpl:coalescing', ...record }),
+      save: (snapshot) => this.scheduleCoalescingSnapshot(snapshot),
+      recordReceipt: (record) => {
+        // Written now, not at the throttled flush: an acknowledged acceptance
+        // must not lose its receipt, the subject's birth, or (deferred) the
+        // accepted work itself to a crash. A failure here fails the acceptance.
+        this.coalescingRecentReceipts.push(record);
+        this.store.setStateJson(COALESCING_RECENT_ID, this.coalescingRecentReceipts);
+      },
+      wasPublished: (subject, eventId) => {
+        // Boot-time only: the occurrence's durable delivery identity
+        // (subject + eventId in message metadata) in any agent's context.
+        for (const agent of this.agents.values()) {
+          try {
+            if (agent.getContextManager().getAllMessages().some((m) =>
+              m.metadata?.coalescingSubject === subject && m.metadata?.eventId === eventId)) return true;
+          } catch { /* a context that cannot be read cannot prove publication */ }
+        }
+        return false;
+      },
+      commit: () => this.commitCoalescingDurable(),
+      saveNow: (snapshot) => {
+        if (this.coalescingSaveTimer) { clearTimeout(this.coalescingSaveTimer); this.coalescingSaveTimer = null; }
+        this.coalescingSnapshotDirty = null;
+        this.store.setStateJson(COALESCING_STATE_ID, snapshot);
+        this.coalescingRecentReceipts = [];
+        this.store.setStateJson(COALESCING_RECENT_ID, []);
+      },
+    });
+    try {
+      coalescer.restore(this.store.getStateJson(COALESCING_STATE_ID) as CoalescingSnapshot | null);
+      const recent = this.store.getStateJson(COALESCING_RECENT_ID) as CoalescingReceiptRecord[] | null;
+      if (Array.isArray(recent)) {
+        coalescer.restoreReceipts(recent);
+        // Until the next snapshot flush checkpoints the recovered state, these
+        // records are its only durable form: keep them in the writable buffer
+        // so the next acceptance appends to them instead of replacing them.
+        this.coalescingRecentReceipts = recent;
+      }
+    } catch (err) {
+      console.error('[coalescing] could not restore coalescing state; starting with unknown history:', err);
+    }
+    this.pushCoalescer = coalescer;
+    // Batches restored from a snapshot still owe the agent a wake (§14 v41).
+    for (const occ of coalescer.pendingBatchOccurrences()) void this.wakeForCoalescedBatch(occ);
+  }
+
+  /**
+   * Durability barrier for coalescing (RFC-006 §3.1/§3.2): everything
+   * written so far is fsynced before the caller proceeds. Group-committed —
+   * all acceptances that arrive in one event-loop turn share one
+   * `store.sync()` — so throughput is bounded by fsync rate per batch, not
+   * per message.
+   */
+  private commitCoalescingDurable(): Promise<void> {
+    if (!this.coalescingCommit) {
+      this.coalescingCommit = new Promise<void>((resolve, reject) => {
+        setImmediate(() => {
+          this.coalescingCommit = null;
+          try { this.store.sync(); resolve(); } catch (err) { reject(err); }
+        });
+      });
+    }
+    return this.coalescingCommit;
+  }
+
+  private scheduleCoalescingSnapshot(snapshot: () => CoalescingSnapshot): void {
+    this.coalescingSnapshotDirty = snapshot;
+    if (this.coalescingSaveTimer) return;
+    const timer = setTimeout(() => this.flushCoalescingSnapshot(), 2_000);
+    timer.unref?.();
+    this.coalescingSaveTimer = timer;
+  }
+
+  private flushCoalescingSnapshot(): void {
+    if (this.coalescingSaveTimer) { clearTimeout(this.coalescingSaveTimer); this.coalescingSaveTimer = null; }
+    const snapshot = this.coalescingSnapshotDirty;
+    this.coalescingSnapshotDirty = null;
+    if (!snapshot) return;
+    try {
+      this.store.setStateJson(COALESCING_STATE_ID, snapshot());
+      this.coalescingRecentReceipts = [];
+      this.store.setStateJson(COALESCING_RECENT_ID, []);
+    } catch (err) {
+      console.error('[coalescing] could not persist coalescing state:', err);
+    }
+  }
+
+  /** Serialize both lanes' admissions: create, edit and delete of one subject stay ordered. */
+  private admitCoalesced<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.coalescingAdmission.then(work, work);
+    this.coalescingAdmission = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private handleCoalescedIncoming(
+    serverId: string,
+    message: ChannelIncomingMessage,
+    event: CoalescedChannelEvent,
+  ): Promise<ChannelIncomingMessageResult> {
+    return this.admitCoalesced(async () => {
+      if (!this.pushCoalescer) throw new CoalesceError('coalesce', 'coalescing unavailable', -32000);
+      validateCoalesceMember(message.coalesce, 'channel');
+      if (typeof message.eventId !== 'string' || !message.eventId) {
+        throw new CoalesceError('eventId', 'eventId is required with coalesce');
+      }
+      if (typeof message.timestamp !== 'string') throw new CoalesceError('timestamp', 'timestamp is required');
+      validateCoalescedContent(message.content);
+      const c = message.coalesce;
+      const result = await this.pushCoalescer.accept({
+        serverId,
+        binding: this.coalescingBinding(serverId),
+        scope: { kind: 'channel', id: message.channelId },
+        key: c.key,
+        eventId: message.eventId,
+        timestamp: message.timestamp,
+        retract: !!c.retract,
+        deferred: false,
+        initial: !!c.initial,
+        tags: event.tags,
+        content: message.content,
+        identity: { messageId: message.messageId, author: message.author, threadId: message.threadId },
+        event: { lane: 'channel', event: { ...event, eventId: message.eventId } },
+      });
+      return { messageId: message.messageId, accepted: true, coalesce: result.coalesce };
+    });
+  }
+
+  private handleCoalescedPush(serverId: string, params: PushEventParams, event: McplPushEvent): Promise<PushEventResult> {
+    return this.admitCoalesced(async () => {
+      if (!this.pushCoalescer) throw new CoalesceError('coalesce', 'coalescing unavailable', -32000);
+      validateCoalesceMember(params.coalesce, 'push');
+      if (typeof params.eventId !== 'string' || !params.eventId) throw new CoalesceError('eventId', 'eventId is required');
+      if (typeof params.timestamp !== 'string') throw new CoalesceError('timestamp', 'timestamp is required');
+      validateCoalescedContent(params.payload?.content);
+      const c = params.coalesce;
+      if (c.channelId) this.assertChannelScopedPush(serverId, c.channelId);
+      const origin = params.origin ?? {};
+      const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
+      return this.pushCoalescer.accept({
+        serverId,
+        binding: this.coalescingBinding(serverId),
+        featureSet: params.featureSet,
+        scope: c.channelId ? { kind: 'channel', id: c.channelId } : { kind: 'featureSet', id: params.featureSet },
+        key: c.key,
+        eventId: params.eventId,
+        timestamp: params.timestamp,
+        retract: !!c.retract,
+        deferred: !!c.deferred,
+        initial: !!c.initial,
+        data: c.data,
+        tags: event.tags,
+        content: params.payload.content,
+        ...(c.channelId ? {
+          identity: {
+            ...(str(origin.messageId) ? { messageId: str(origin.messageId) } : {}),
+            ...(str(origin.threadId) ? { threadId: str(origin.threadId) } : {}),
+            ...(str(origin.authorId) ? { author: { id: str(origin.authorId)!, name: str(origin.authorName) ?? str(origin.authorId)! } } : {}),
+          },
+        } : {}),
+        event: { lane: 'push', event },
+      });
+    });
+  }
+
+  /** §3.2: a channel-scoped push needs what a channels/incoming message needs. */
+  private assertChannelScopedPush(serverId: string, channelId: string): void {
+    const server = this.mcplServerRegistry?.getServer(serverId);
+    if (!server?.policyEstablished || !server.grant.has('channels.incoming')) {
+      throw new CoalesceError('coalesce.channelId', 'Channel not permitted', -32017);
+    }
+    if (!this.channelRegistry?.isDeclaredChannel(serverId, channelId)) {
+      throw new CoalesceError('coalesce.channelId', 'Unknown channel', -32023);
+    }
+  }
+
+  private coalescedAuthorized(occ: CoalescedOccurrence<CoalescedDelivery>): boolean {
+    const server = this.mcplServerRegistry?.getServer(occ.serverId);
+    if (!server?.isConnected || !server.policyEstablished) return false;
+    // §3.2: work admitted under another binding (the id since reassigned to a
+    // different endpoint) never acquires the replacement peer's authority —
+    // and its private notice data is never sent to that peer.
+    if (occ.binding !== this.coalescingBinding(occ.serverId)) return false;
+    if (occ.event.lane === 'push') {
+      if (!server.grant.has('pushEvents')) return false;
+      try { this.featureSetManager?.validateInbound(occ.serverId, occ.event.event.featureSet); } catch { return false; }
+    }
+    if (occ.scope.kind === 'channel' || occ.event.lane === 'channel') {
+      // §3.2 / §5.4 rule 4: the channel's CURRENT authority, whichever lane.
+      if (!server.grant.has('channels.incoming')) return false;
+      if (occ.event.lane === 'push') return this.channelRegistry?.isDeclaredChannel(occ.serverId, occ.scope.id) ?? false;
+      return !!this.channelRegistry?.getDescriptor(occ.scope.id);
+    }
+    return true;
+  }
+
+  private async coalescedAudience(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<string[]> {
+    if (occ.deliverTo) return this.agents.has(occ.deliverTo) ? [occ.deliverTo] : [];
+    const explicit = occ.event.event.targetAgents;
+    if (explicit) return explicit.filter((n) => this.agents.has(n));
+    if (occ.scope.kind === 'channel' && this.conversationRouter) {
+      const router = this.conversationRouter;
+      const bound = router.getBinding(occ.scope.id)?.agentName;
+      if (bound) return this.agents.has(bound) ? [bound] : [];
+      // No fork yet: the same bind decision an incoming message would get. A
+      // batch that qualifies spawns its fork now so it has someone to wake.
+      const metadata = (occ.event.lane === 'channel' ? occ.event.event.metadata : occ.event.event.origin) ?? {};
+      const decision = router.route({
+        channelId: occ.scope.id,
+        mentioned: metadata.mentioned === true,
+        kind: ConversationRouter.classifyChannel(this.channelRegistry?.getDescriptor(occ.scope.id), metadata),
+      });
+      if (decision.kind !== 'spawn') return decision.kind === 'unbound' ? [] : (this.agents.has(decision.agentName) ? [decision.agentName] : []);
+      try {
+        await this.createConversationAgent(decision.agentName, occ.scope.id);
+        router.bind(occ.scope.id, decision.agentName, decision.generation);
+        this.persistConversationRouterState();
+        return [decision.agentName];
+      } catch (err) {
+        console.error(`[coalescing] could not spawn a conversation agent for ${occ.scope.id}:`, err);
+        return [];
+      }
+    }
+    return [...this.agents.keys()].filter((n) => !this.conversationAgentHomes.has(n) && n !== this.subconsciousAgentName);
+  }
+
+  /** Deliver through the lane's ordinary path; report where it landed. */
+  private async deliverCoalesced(
+    occ: CoalescedOccurrence<CoalescedDelivery>,
+    materialized?: McplContentBlock[],
+    assemblingFor?: string,
+  ): Promise<CoalescingPlacement | undefined> {
+    const coalescingSubject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
+    const narrowing = occ.deliverTo ? { deliverTo: occ.deliverTo } : {};
+    if (occ.event.lane === 'channel') {
+      const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...(assemblingFor ? { assemblingFor } : {}) };
+      const placement = await this.handleMcplChannelIncoming(event);
+      await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
+      return placement;
+    }
+    if (occ.scope.kind === 'channel') {
+      // §3.2: a channel-scoped push addresses the channel's subject namespace,
+      // so it is delivered as a message OF that channel — same routing
+      // (conversation forks, tune-out, closed-channel invitation), same reply
+      // locus, and the subject's stable platform identity (§3.1, vector 43).
+      const push = occ.event.event;
+      const identity = { ...this.pushCoalescer?.identity(coalescingSubject), ...occ.identity };
+      const origin = push.origin ?? {};
+      const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
+      const event: CoalescedChannelEvent = {
+        type: 'mcpl:channel-incoming',
+        serverId: occ.serverId,
+        channelId: occ.scope.id,
+        messageId: identity.messageId ?? str(origin.messageId) ?? occ.eventId,
+        threadId: identity.threadId ?? str(origin.threadId),
+        author: identity.author ?? { id: str(origin.authorId) ?? '', name: str(origin.authorName) ?? str(origin.authorId) ?? 'Someone' },
+        content: materialized ? materialized.map(convertPushBlock) : push.content,
+        timestamp: occ.timestamp,
+        metadata: origin,
+        tags: push.tags,
+        triggerInference: assemblingFor ? false : push.triggerInference,
+        targetAgents: push.targetAgents,
+        coalescingSubject,
+        eventId: occ.eventId,
+        ...narrowing,
+        ...(assemblingFor ? { assemblingFor } : {}),
+      };
+      const placement = await this.handleMcplChannelIncoming(event);
+      await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
+      return placement;
+    }
+    const event: McplPushEvent = {
+      ...occ.event.event,
+      eventId: occ.eventId,
+      timestamp: occ.timestamp,
+      ...(materialized ? { content: materialized.map(convertPushBlock) } : {}),
+      coalescingSubject,
+      // §5.2: the materialized occurrence is consumed by the request being
+      // assembled; the wake that started it is not repeated.
+      ...(assemblingFor ? { assemblingFor, triggerInference: false } : {}),
+      ...(occ.deliverTo ? { targetAgents: [occ.deliverTo] } : {}),
+    };
+    const placement = this.handleMcplPushEvent(event);
+    await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
+    return placement;
+  }
+
+  private async wakeForCoalescedBatch(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<void> {
+    const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
+    this.cancelCoalescedWakes(subject);
+    if (occ.event.lane !== 'push' || !occ.event.event.triggerInference) return;
+    const origin = occ.event.event.origin;
+    // The wake carries the batch's channel so the turn freezes its reply
+    // locus there (the materialized delivery at assembly wakes nobody).
+    const channelId = occ.scope.kind === 'channel' ? occ.scope.id : this.derivePushEventChannel(origin)?.channelId;
+    const authorId = occ.identity?.author?.id ?? (typeof origin?.authorId === 'string' ? origin.authorId : undefined);
+    for (const agentName of await this.coalescedAudience(occ)) {
+      this.pendingRequests.push({
+        agentName,
+        reason: 'mcpl:push-event',
+        source: occ.serverId,
+        timestamp: Date.now(),
+        channelId,
+        counterparty: authorId ? `${occ.serverId}:user:${authorId}` : undefined,
+        addressed: isAddressedMessage(occ.tags, origin),
+        coalescingSubject: subject,
+      });
+    }
+  }
+
+  /** Withdraw unstarted wakes whose sole cause is this subject (§4.2). */
+  private cancelCoalescedWakes(subject: string): void {
+    this.pendingRequests = this.pendingRequests.filter((r) => r.coalescingSubject !== subject);
+    for (const cooldown of this.providerAccelerationCooldowns.values()) {
+      cooldown.heldRequests = cooldown.heldRequests.filter((r) => r.coalescingSubject !== subject);
+    }
+  }
+
+  /**
+   * A placement in the deferred queue is upgraded in place once the flush has
+   * stored it: the stored copy carries `metadata.deferredWriteId`, found by
+   * scanning the unread tail (above the watermark) — never below it.
+   */
+  private resolvePlacement(p: CoalescingPlacement): void {
+    if (!p.deferredId || this.deferredMessages.some((m) => m.id === p.deferredId)) return;
+    const agent = this.agents.get(p.agent);
+    if (!agent) return;
+    const cm = agent.getContextManager();
+    const watermark = agent.getConsumedWatermark();
+    const floor = watermark && watermark.branch === cm.currentBranch().name ? watermark.sequence : Number.POSITIVE_INFINITY;
+    const all = cm.getAllMessages();
+    for (let i = all.length - 1; i >= 0 && all[i].sequence > floor; i--) {
+      if (all[i].metadata?.deferredWriteId === p.deferredId) {
+        p.messageId = all[i].id;
+        delete p.deferredId;
+        return;
+      }
+    }
+  }
+
+  private isUnreadPlacement(p: CoalescingPlacement): boolean {
+    this.resolvePlacement(p);
+    if (p.deferredId) return this.deferredMessages.some((m) => m.id === p.deferredId);
+    if (!p.messageId) return false;
+    const agent = this.agents.get(p.agent);
+    return !!agent && this.isUnreadStoredMessage(agent, p.messageId);
+  }
+
+  /**
+   * Unread = stored, above the agent's consumed watermark on the current
+   * branch, not a body-group shard (immutable), and not folded into any
+   * summary (compression is consumption, §3.3). Conservative on every doubt.
+   */
+  private isUnreadStoredMessage(agent: Agent, messageId: MessageId): boolean {
+    const cm = agent.getContextManager();
+    let message: ReturnType<ContextManager['getMessage']>;
+    try { message = cm.getMessage(messageId); } catch { return false; }
+    if (!message || message.bodyGroupId) return false;
+    // Every agent that can read this message must not have compiled past it.
+    // Residents share one message slot, so a message one of them read is
+    // history for all of them (the never-rewrite rule is about the message,
+    // not the agent that happened to be asked). A tune-out-diverted message
+    // never enters a resident's compiled view; only the subconscious reads
+    // it through its merged view — no subconscious, nobody reads it.
+    let readers: Agent[];
+    if ((message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut) {
+      const subconscious = this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined;
+      if (!subconscious) return true;
+      readers = [subconscious];
+    } else {
+      readers = this.sharedSlotAgents.has(agent)
+        ? [...this.sharedSlotAgents].filter((a) => this.agents.get(a.name) === a)
+        : [agent];
+    }
+    const branch = cm.currentBranch().name;
+    const ts = message.timestamp instanceof Date ? message.timestamp.getTime() : Number(message.timestamp);
+    for (const reader of readers) {
+      const watermark = reader.getConsumedWatermark();
+      if (!watermark || watermark.branch !== branch || message.sequence <= watermark.sequence) return false;
+      // Compression is consumption (§3.3): folded into any reader's summary.
+      try {
+        const rcm = reader.getContextManager();
+        const strategy = rcm.getStrategy() as { getSummary?: (id: string) => { sourceIds?: string[]; sourceLevel?: number } | null };
+        for (const summary of rcm.getSummariesInRange({ fromMs: ts, toMs: ts })) {
+          const entry = strategy.getSummary?.(summary.id);
+          if (!entry || (entry.sourceLevel ?? 0) > 0 || entry.sourceIds?.includes(messageId)) return false;
+        }
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private removePlacement(p: CoalescingPlacement): boolean {
+    this.resolvePlacement(p);
+    if (p.deferredId) {
+      const before = this.deferredMessages.length;
+      this.deferredMessages = this.deferredMessages.filter((m) => m.id !== p.deferredId);
+      if (this.deferredMessages.length === before) return false;
+      if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
+      return true;
+    }
+    if (!p.messageId) return false;
+    const agent = this.agents.get(p.agent);
+    if (!agent) return false;
+    try {
+      agent.getContextManager().removeMessage(p.messageId);
+      this.emitTrace({ type: 'message:removed', messageId: p.messageId, source: 'mcpl:coalescing' });
+      return true;
+    } catch (err) {
+      console.error(`[coalescing] could not remove unread message ${p.messageId} for ${agent.name}:`, err);
+      return false;
+    }
+  }
+
   /**
    * Convert an MCPL push event to a context message.
    */
-  private handleMcplPushEvent(event: McplPushEvent): void {
+  private handleMcplPushEvent(event: McplPushEvent): CoalescingPlacement | undefined {
     const triggerChannel = this.derivePushEventChannel(event.origin);
     if (triggerChannel && this.channelRegistry) {
       this.channelRegistry.ensureChannelRegistered(
@@ -5357,6 +7836,7 @@ export class AgentFramework {
       eventId: event.eventId,
       triggered: event.triggerInference ?? false,
       ...(event.tags ? { tags: event.tags } : {}),
+      ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
     };
     // `origin.channelId` is the server-internal raw id (a bare Discord
     // snowflake) — unroutable as a locus and unresolvable by the agent. Store
@@ -5389,7 +7869,8 @@ export class AgentFramework {
       }
     }
 
-    const id = this.addMessage('user', content, metadata);
+    const placement: CoalescingPlacement = { agent: '' };
+    const id = this.addMessage('user', content, metadata, { placement, bypassDeferralFor: event.assemblingFor });
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
 
     if (event.triggerInference) {
@@ -5408,9 +7889,11 @@ export class AgentFramework {
           // they must outrank ambient chatter in a batched wake's locus
           // selection just like their channels/incoming counterparts.
           addressed: isAddressedMessage(event.tags, event.origin),
+          ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
         });
       }
     }
+    return placement.agent ? placement : undefined;
   }
 
   /**
@@ -5511,7 +7994,7 @@ export class AgentFramework {
 
       const providerCooldown = this.providerAccelerationCooldowns?.get(agentName);
       if (providerCooldown) {
-        if (now < providerCooldown.until) {
+        if (now < providerCooldown.until || this.extendHostProviderHold(agentName, providerCooldown)) {
           for (const req of requests) {
             if (!providerCooldown.heldRequests.some((r) => this.sameInferenceRequest(r, req))) {
               providerCooldown.heldRequests.push(req);
@@ -5547,16 +8030,63 @@ export class AgentFramework {
       // This mirrors how the restart has always overwritten activeStreams
       // rather than waiting for the old stream's teardown.
       const budgetRestart = requests.find((r) => r.reason === 'context_budget_restart');
+
+      // Host quiesce (issue #122): park wakes instead of starting turns —
+      // the requeue mirrors the busy path below, so requests survive and
+      // fire at resume. A context-budget restart passes through: it
+      // CONTINUES a turn whose token is held (see the deadlock note below),
+      // and quiesce's drain is exactly the phase where such a turn must be
+      // allowed to finish. Parked requests are coalesced per reason (newest
+      // kept): heartbeat/gate wakes arrive once per tick and nothing else
+      // bounds a multi-day maintenance window's accumulation.
+      if (this.quiesced) {
+        // Continuations of a held turn (budget restart, non-streaming tool
+        // results) pass; everything else parks.
+        const passThrough = requests.filter((r) => isTurnContinuation(r.reason));
+        const parked = requests.filter((r) => !isTurnContinuation(r.reason));
+        // Coalesce per (reason, addressed): every channel wake shares one
+        // reason, so keying on reason alone would let an ambient message
+        // parked later evict a DM/mention parked earlier — and the
+        // addressed-outranks-ambient trigger selection below would then
+        // route the resumed turn into the wrong channel.
+        const newestByKey = new Map<string, InferenceRequest>();
+        for (const request of parked) {
+          // A coalesced wake is withdrawable by its subject (RFC-006 §4.2); it
+          // must not absorb an unrelated wake that would vanish with it.
+          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${request.coalescingSubject ?? ''}|${request.scriptWakeId ?? ''}`;
+          const prev = newestByKey.get(key);
+          if (!prev || request.timestamp >= prev.timestamp) {
+            newestByKey.set(key, request);
+          }
+        }
+        this.pendingRequests.push(...newestByKey.values());
+        if (passThrough.length === 0) continue;
+        // The continuation continues its held turn; its parked siblings must
+        // NOT be consumed by that turn — they were re-parked above, so narrow
+        // the batch to the continuation(s) alone before the trigger selection.
+        requests.length = 0;
+        requests.push(...passThrough);
+      }
+
       const turnAlive = !budgetRestart && this.activeTurnTokens.has(agentName);
       const providerGate = this.providerGates?.get(agentName);
       // A primary can own provider admission while yielding to an already in-flight
       // auxiliary call. Keep this agent's later wakes queued, but do not block the
       // framework event loop or other residents while that auxiliary call settles.
       const providerPrimaryWaiting = (providerGate?.primaryDepth ?? 0) > 0 && !this.activeTurnTokens.has(agentName);
-      if (providerPrimaryWaiting || turnAlive || agent.state.status === 'inferring' || agent.state.status === 'streaming' || agent.state.status === 'waiting_for_tools') {
-        // Re-queue requests, but warn if they've been pending too long
+      // A live surgery (rollback/suppress) holds the whole store: no turn may
+      // start for ANY agent — including one registered after the reservation's
+      // token snapshot — until the switch has landed or been rolled back.
+      // Truthiness, not `!== null`: prototype-built harnesses (and any field
+      // added later) leave the slot undefined, which must read as "not held".
+      const surgeryHeld = !!this.surgeryHold;
+      if (surgeryHeld || providerPrimaryWaiting || turnAlive || agent.state.status === 'inferring' || agent.state.status === 'streaming' || agent.state.status === 'waiting_for_tools') {
+        // Re-queue requests, but warn if they've been pending too long.
+        // Suppressed while quiesced: a drain-phase busy requeue is expected,
+        // not a wedge tell.
         const oldest = Math.min(...requests.map(r => r.timestamp));
         if (
+          !this.quiesced &&
           now - oldest > STALE_REQUEST_MS &&
           (this.staleWarnAt.get(agentName) ?? 0) < now - 60_000
         ) {
@@ -5569,9 +8099,11 @@ export class AgentFramework {
           // read 'idle' while a turn's teardown is pending, and a LEAKED turn
           // token would look exactly like this — permanently requeued wakes.
           // This line is the wedge's tell (idle+turn-alive, forever).
-          const shownStatus = turnAlive && agent.state.status === 'idle'
-            ? 'idle+turn-alive'
-            : agent.state.status;
+          const shownStatus = surgeryHeld && agent.state.status === 'idle'
+            ? `idle+surgery(${this.surgeryHold!.verb})`
+            : turnAlive && agent.state.status === 'idle'
+              ? 'idle+turn-alive'
+              : agent.state.status;
           this.emitTrace({
             type: 'inference:request_stale',
             agentName,
@@ -6147,6 +8679,20 @@ export class AgentFramework {
             console.error(`[provider-admission] ${agent.name}: turn-alive while parked — wake requeued, not started`);
             return;
           }
+          // Same gap, second hazard (#122): the host may have QUIESCED while
+          // this wake was parked. The scheduler's quiesce gate ran before the
+          // park; starting here would bypass it and run a turn against a
+          // context the operator believes frozen. Give admission back and
+          // requeue — the scheduler re-parks it (coalesced) until resume.
+          // Continuations of a held turn pass, as they do at the gate.
+          if (this.quiesced && !isTurnContinuation(trigger?.reason ?? '')) {
+            this.releasePrimaryProviderGate(agent.name);
+            this.pendingRequests.push(trigger ?? {
+              agentName: agent.name, reason: 'provider-admission:requeue', source: 'scheduler', timestamp: Date.now(),
+            });
+            console.error(`[provider-admission] ${agent.name}: host quiesced while parked — wake requeued, not started`);
+            return;
+          }
           await this.startAgentStream(agent, trigger, attempt, true);
         }).catch((error) => {
           this.releasePrimaryProviderGate(agent.name);
@@ -6228,7 +8774,9 @@ export class AgentFramework {
           // poison message — or a transient store-write failure — must not
           // abort the turn or drop the messages behind it in the queue.
           try {
-            const id = agent.getContextManager().addMessage(msg.participant, msg.content, msg.metadata);
+            const id = agent.getContextManager().addMessage(
+              msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id),
+            );
             this.emitTrace({ type: 'message:added', messageId: id, source: 'deferred-flush:turn-start' });
           } catch (err) {
             console.error(
@@ -6238,6 +8786,19 @@ export class AgentFramework {
             );
           }
         }
+        this.ackDeferredWrites();
+      }
+    }
+
+    // RFC-006 §5: deferred batches for this agent render now, at the assembly
+    // boundary — after the deferred flush (same window: turn alive, compile
+    // not yet run) and before the checkpoint (they are the turn's inputs).
+    // Not on a context-budget restart: that continues the same logical turn.
+    if (attempt === 0 && trigger?.reason !== 'context_budget_restart' && this.pushCoalescer?.pendingBatches()) {
+      try {
+        await this.pushCoalescer.assemble(agent.name);
+      } catch (err) {
+        console.error(`[coalescing] assembly for ${agent.name} failed:`, err);
       }
     }
 
@@ -6538,6 +9099,12 @@ export class AgentFramework {
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
     };
+    // Output tokens billed since this turn's assistant blocks were last
+    // persisted. The residual over the round's visible blocks is the price of
+    // its hidden thinking, stamped on the signed blocks at persist time
+    // (thinking-token-stamp.ts). Accumulates across max_tokens continuations
+    // within a round; reset at each stamp.
+    let outputTokensSinceStamp = 0;
     // This turn's alive-marker, set at startAgentStream entry. Safe to read
     // from the map here: the turn-alive busy check in processInferenceRequests
     // means no successor turn can have replaced it while we compiled.
@@ -6619,6 +9186,9 @@ export class AgentFramework {
     // id makes the discarded attempt's chunk buffer orphaned (never
     // finalized) instead of being appended to — see the 'retrying' case.
     let outgoingInferenceId = newOutgoingInferenceId();
+    // RFC-007: every inference id THIS stream mints, so the stream's end
+    // aborts only its own open tool calls — never a successor's.
+    const lifecycleInferenceIds = new Set<string>([outgoingInferenceId]);
     let outgoingIndex = 0;
 
     // §10.5 inference/lifecycle: `started` now, exactly one terminal in the
@@ -6716,6 +9286,7 @@ export class AgentFramework {
                 ' — discarding the refused attempt',
             );
             outgoingInferenceId = newOutgoingInferenceId();
+            lifecycleInferenceIds.add(outgoingInferenceId);
             outgoingIndex = 0;
             proseStream?.reset();
             this.emitTrace({
@@ -6801,6 +9372,8 @@ export class AgentFramework {
                 });
               }
             }
+            assistantBlocks = stampThinkingTokenEstimates(assistantBlocks, outputTokensSinceStamp);
+            outputTokensSinceStamp = 0;
             this.pendingAssistantBlocks.set(agent.name, assistantBlocks);
 
             // Note: max_tokens truncation cannot produce tool-calls events here.
@@ -6812,7 +9385,14 @@ export class AgentFramework {
             agent.enterWaitingForTools(event.calls, stream);
 
             for (const call of event.calls) {
+              // RFC-007: register at the one dispatch point for model-issued
+              // calls, keyed by (agent, call id) with this inference's id;
+              // `started` goes out once dispatch returns. Refusal sites inside
+              // dispatch run synchronously and call refuse() first, so a call
+              // the host refuses produces no events.
+              this.toolLifecycleEmitter?.register(agent.name, outgoingInferenceId, call);
               this.dispatchToolCall(agent.name, call);
+              this.toolLifecycleEmitter?.open(agent.name, call.id);
             }
 
             // Speak-while-acting: route THIS round's prose to the locus NOW
@@ -6949,9 +9529,11 @@ export class AgentFramework {
                 b.type === 'tool_use' || b.type === 'tool_result' ? i : last,
               -1
             );
-            const terminalContent = lastToolIdx >= 0
-              ? response.content.slice(lastToolIdx + 1)
-              : response.content;
+            const terminalContent = stampThinkingTokenEstimates(
+              lastToolIdx >= 0 ? response.content.slice(lastToolIdx + 1) : response.content,
+              outputTokensSinceStamp,
+            );
+            outputTokensSinceStamp = 0;
             // This is a whole-response boundary, not a trailing-prose
             // classifier. If the turn executed any genuine structured tool
             // call, preserve its later prose exactly as ordinary history.
@@ -7413,6 +9995,41 @@ export class AgentFramework {
             this.abortAgentScript(agent.name, 'stream error');
             agent.reset();
 
+            // A quiesce-abandoned cancel may surface as `error` instead of
+            // `aborted` depending on how the stream implementation reports
+            // the cancellation. Same contract as the aborted branch: settle
+            // honestly, no errorPolicy retry (which would relaunch inference
+            // mid-maintenance-window), no inference:exhausted (which feeds
+            // the failure streak / hard-down / poison-history accounting).
+            {
+              const cancelKey = `${agent.name}:${myStreamId}`;
+              if (this.frameworkCancelledStreams.get(cancelKey) === 'quiesce_abandoned') {
+                this.frameworkCancelledStreams.delete(cancelKey);
+                // Same terminal as the `aborted` twin: §10.5 lifecycle reads
+                // 'aborted' (not 'completed'), and the gate is released only
+                // for THIS agent instance — a name re-registered meanwhile
+                // (ephemeral disposal, conversation replacement) owns its own
+                // gate liveness. The inference-log terminal was already
+                // written at the top of this case (`Stream error`).
+                lifecyclePhase = 'aborted';
+                this.settleAgent(agent.name, {
+                  stopReason: 'exhausted',
+                  speech: '',
+                  error: 'Turn abandoned by operator quiesce',
+                });
+                this.emitTrace({
+                  type: 'inference:aborted',
+                  agentName: agent.name,
+                  durationMs,
+                  reason: 'quiesce_abandoned',
+                });
+                if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) {
+                  this.eventGate?.onInferenceEnded(agent.name);
+                }
+                break;
+              }
+            }
+
             if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
               lifecyclePhase = 'failed';
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
@@ -7467,6 +10084,30 @@ export class AgentFramework {
                   preserveEventGateForSuccessor = true;
                 } else if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) {
                   this.eventGate?.onInferenceEnded(agent.name);
+                }
+                if (cancelKind === 'quiesce_abandoned') {
+                  // Operator-initiated cancel during a quiesce drain. Settle
+                  // the turn honestly — deliberately NO inference:exhausted:
+                  // that trace centrally drives the consecutive-failure
+                  // streak, hard-down ops alerts, and the poison-history
+                  // breaker, none of which an operator cancel represents.
+                  // inference:aborted carries the observability instead.
+                  if (agent.streamId === myStreamId) {
+                    this.abortAgentScript(agent.name, 'turn abandoned by quiesce');
+                    agent.reset();
+                    this.settleAgent(agent.name, {
+                      stopReason: 'exhausted',
+                      speech: '',
+                      error: 'Turn abandoned by operator quiesce',
+                    });
+                  }
+                  this.emitTrace({
+                    type: 'inference:aborted',
+                    agentName: agent.name,
+                    durationMs: Date.now() - startTime,
+                    reason: 'quiesce_abandoned',
+                  });
+                  return;
                 }
                 // endTurn IS a logical turn end — earlier rounds may have
                 // live-routed prose (narrate → skip_reply is a real shape),
@@ -7555,6 +10196,7 @@ export class AgentFramework {
               ),
             };
             previousUsage = cumulativeUsage;
+            outputTokensSinceStamp += perCallUsage.outputTokens;
             const strat = (agent as unknown as {
               getContextManager?: () => { getStrategy?: () => unknown };
             }).getContextManager?.()?.getStrategy?.() as
@@ -7694,6 +10336,13 @@ export class AgentFramework {
       // completed; catch → failed; framework-cancel → aborted). A host
       // crash emits nothing — that is the documented best-effort limit, and
       // why consumers keep their safety timeout.
+      //
+      // RFC-007 §7.3: a tool call still open when its turn's stream ends was
+      // cancelled before a result — its terminal is `aborted`. (A normal turn
+      // has none: the stream waits for every result before continuing.)
+      // Scoped to this stream's own inference ids: a budget-restart successor
+      // may already be running for the same agent.
+      this.toolLifecycleEmitter?.abortOpen(agent.name, lifecycleInferenceIds);
       this.hookOrchestrator?.emitLifecycle({
         inferenceId: outgoingInferenceId,
         conversationId: agent.name,
@@ -7759,9 +10408,12 @@ export class AgentFramework {
       if (frameReachedTerminal && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
         const deferred = this.drainDeferredFor(agent.name);
         for (const msg of deferred) {
-          this.addMessage(msg.participant, msg.content, msg.metadata,
-            msg.forAgent ? { forAgent: msg.forAgent } : undefined);
+          this.addMessage(msg.participant, msg.content, msg.metadata, {
+            deferredWriteId: msg.id,
+            ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
+          });
         }
+        this.ackDeferredWrites();
       }
     }
   }
@@ -7832,6 +10484,11 @@ export class AgentFramework {
     // Idle AND no turn alive: status reads 'idle' from dequeue until the
     // stream registers, and again while a turn's teardown is pending
     // (the scheduler's own busy test, 'idle+turn-alive').
+    if (this.surgeryHold) {
+      throw new Error(
+        `puppet refused: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName} — retry when it completes`,
+      );
+    }
     if (agent.state.status !== 'idle' || this.activeTurnTokens.has(agentName)) {
       const shown = agent.state.status === 'idle' ? 'idle+turn-alive' : agent.state.status;
       throw new Error(
@@ -7907,8 +10564,8 @@ export class AgentFramework {
         cm.addMessage('user', blocks);
       } else {
         this.deferredMessages.push(
-          { participant: agentName, content: toolUse, forAgent: agentName },
-          { participant: 'user', content: blocks, forAgent: agentName },
+          { id: randomUUID(), seq: ++this.deferredSeq, participant: agentName, content: toolUse, forAgent: agentName },
+          { id: randomUUID(), seq: ++this.deferredSeq, participant: 'user', content: blocks, forAgent: agentName },
         );
       }
 
@@ -7938,9 +10595,12 @@ export class AgentFramework {
       if (!this.activeTurnTokens.has(agentName)
         && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
         for (const msg of this.drainDeferredFor(agentName)) {
-          this.addMessage(msg.participant, msg.content, msg.metadata,
-            msg.forAgent ? { forAgent: msg.forAgent } : undefined);
+          this.addMessage(msg.participant, msg.content, msg.metadata, {
+            deferredWriteId: msg.id,
+            ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
+          });
         }
+        this.ackDeferredWrites();
       }
     }
   }
@@ -8039,6 +10699,7 @@ export class AgentFramework {
     const startTime = Date.now();
     this.runCodeExecution(agentName, call)
       .catch((error): ToolResult => {
+        this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
         // runCodeExecution is designed not to reject; this is the last-resort
         // guard so a bug here can never strand the agent in waiting_for_tools.
         const err = error instanceof Error ? error : new Error(String(error));
@@ -8088,6 +10749,7 @@ export class AgentFramework {
       background?: unknown;
       action?: unknown;
       script_id?: unknown;
+      time_limit_ms?: unknown;
       wait_ms?: unknown;
       on_timeout?: unknown;
     };
@@ -8154,6 +10816,18 @@ export class AgentFramework {
       };
     }
 
+    // A per-call time limit, capped by the deployment's ceiling (the result says when it was capped).
+    if (input.time_limit_ms !== undefined && (typeof input.time_limit_ms !== 'number' || !Number.isFinite(input.time_limit_ms) || input.time_limit_ms < 1000)) {
+      return { success: false, error: '`time_limit_ms` must be a number of milliseconds, at least 1000', isError: true };
+    }
+    const limits = scriptTimeLimits(this.codeExecutionConfig ?? undefined);
+    const ceilingMs = input.background === true ? limits.backgroundMaxMs : limits.maxMs;
+    const requestedMs = input.time_limit_ms === undefined ? undefined : Math.floor(input.time_limit_ms);
+    const timeLimitMs = requestedMs === undefined ? undefined : Math.min(requestedMs, ceilingMs);
+    const capNote = requestedMs !== undefined && requestedMs > ceilingMs
+      ? `time_limit_ms ${requestedMs} was capped at ${ceilingMs}, this deployment's maximum`
+      : undefined;
+
     const agent = this.agents.get(agentName);
     const surface = agent
       ? this.getToolsForAgent(agentName).filter((t) => agent.canUseTool(t.name))
@@ -8163,7 +10837,12 @@ export class AgentFramework {
     );
 
     if (input.background === true) {
-      const started = this.startBackgroundScript(agentName, input.code, injected);
+      const started = this.startBackgroundScript(agentName, input.code, injected, timeLimitMs);
+      if (started.success && started.data && typeof started.data === 'object') {
+        const record = this.codeExecutionScripts.get((started.data as { script_id: string }).script_id)!;
+        record.timeLimitNote = capNote;
+        if (capNote) (started.data as Record<string, unknown>).time_limit_note = capNote;
+      }
       if (!started.success || (input.wait_ms === undefined && input.on_timeout === undefined)) return started;
       const id = (started.data as { script_id: string }).script_id;
       return this.observeCodeExecution(this.codeExecutionScripts.get(id)!, waitMs, onTimeout);
@@ -8182,12 +10861,12 @@ export class AgentFramework {
       mode: 'foreground', code: input.code, startedAt: Date.now(),
       wakes: 0, lastWakeAt: null, logPath: null, status: 'running', cancelled: false,
       endTurn: false, wakeQueue: Promise.resolve(), wakeAbort: new AbortController(),
-      run: undefined!,
+      run: undefined!, timeLimitNote: capNote,
     };
     this.codeExecutionScripts.set(record.id, record);
     this.emitTrace({ type: 'tool:started', module: 'code_execution', tool: `foreground:${record.id}`,
       callId: record.id, input: { lines: record.code.split('\n').length } });
-    record.run = new ScriptRun(runner.exec(input.code, injected), (exec, notify, observed) =>
+    record.run = new ScriptRun(runner.exec(input.code, injected, undefined, { deadlineMs: timeLimitMs ?? limits.defaultMs }), (exec, notify, observed) =>
       this.settleCodeExecution(record, exec, notify, observed));
     return this.observeCodeExecution(record, waitMs, onTimeout);
   }
@@ -8203,6 +10882,7 @@ export class AgentFramework {
       success: true, isError: false,
       data: {
         script_id: record.id, status: exec ? record.status : 'running', mode: record.mode,
+        ...(record.timeLimitNote ? { time_limit_note: record.timeLimitNote } : {}),
         ...(exec ? { stdout: exec.stdout, stderr: exec.stderr, return_code: exec.returnCode,
           ...(exec.aborted ? { aborted: true } : {}), ...(exec.tail ? { tail: exec.tail } : {}) }
           : { note: 'Still running. Completion will notify you; use action=wait to retrieve the result. Waiting does not cancel execution.' }),
@@ -8246,6 +10926,7 @@ export class AgentFramework {
     agentName: string,
     code: string,
     injected: import('./code-execution/py-runner.js').InjectedTool[],
+    timeLimitMs?: number,
   ): ToolResult {
     // v1: primary-agent-only. A conversation fork's or ephemeral's daemon
     // would outlive its owner. Keep the existing restriction rather than
@@ -8271,7 +10952,7 @@ export class AgentFramework {
     }
 
     const scriptId = `bg-${++this.codeExecutionScriptCounter}`;
-    const lifetimeMs = cfg?.backgroundMaxLifetimeMs ?? 86_400_000;
+    const lifetimeMs = timeLimitMs ?? cfg?.backgroundMaxLifetimeMs ?? 86_400_000;
 
     // Journal: a file under the agent's first read-write workspace mount so
     // their existing read/grep/shell tools work on it. Python appends
@@ -8333,6 +11014,7 @@ export class AgentFramework {
         script_id: scriptId,
         log: logPath ?? 'no writable workspace mount — output is not retrievable; only wake_agent() reaches you',
         lifetime_hours: Math.round(lifetimeMs / 3_600_000 * 10) / 10,
+        lifetime: formatLimit(lifetimeMs), // exact for short limits, which lifetime_hours rounds to 0
         note: 'The script dies if the host process restarts. Manage with code_execution {"action": "list"|"cancel"}.',
       },
     };
@@ -8468,9 +11150,11 @@ export class AgentFramework {
   private injectScriptWake(record: CodeExecutionRecord, envelope: string): string | null {
     if (!this.agents.has(record.agentName)) return 'script owner is no longer registered';
     try {
+      const scriptWakeId = randomUUID();
       const messageId = this.addMessage('user', [{ type: 'text', text: envelope }], {
         source: 'background-script',
         scriptId: record.id,
+        scriptWakeId,
         tags: ['script:wake'],
         system: true,
       }, { forAgent: record.agentName });
@@ -8478,6 +11162,7 @@ export class AgentFramework {
         agentName: record.agentName,
         reason: 'script:wake',
         source: 'code_execution',
+        scriptWakeId,
         timestamp: Date.now(),
       });
       this.emitTrace({
@@ -8490,6 +11175,24 @@ export class AgentFramework {
       const error = `wake injection failed: ${err instanceof Error ? err.message : String(err)}`;
       console.error(`[pytc:${record.agentName}:${record.id}] ${error}`);
       return error;
+    }
+  }
+
+  /** Retire only the script notifications actually passed to a live continuation. */
+  private consumeInjectedScriptWakes(agentName: string, injections: Array<{ metadata?: MessageMetadata }>): void {
+    const delivered = new Set(injections
+      .filter(m => m.metadata?.source === 'background-script')
+      .map(m => m.metadata?.scriptWakeId)
+      .filter((id): id is string => typeof id === 'string'));
+    if (delivered.size === 0) return;
+    const keep = (request: InferenceRequest) => request.agentName !== agentName ||
+      request.scriptWakeId === undefined || !delivered.has(request.scriptWakeId);
+    this.pendingRequests = this.pendingRequests.filter(keep);
+    const cooldown = this.providerAccelerationCooldowns.get(agentName);
+    if (cooldown) {
+      cooldown.heldRequests = cooldown.heldRequests.filter(keep);
+      const recovery = this.providerAccelerationRecoveries.get(agentName);
+      if (recovery) recovery.heldRequests = cooldown.heldRequests.length;
     }
   }
 
@@ -8950,11 +11653,18 @@ export class AgentFramework {
     // Blob threshold: 10KB - typical context-heavy requests exceed this
     const BLOB_THRESHOLD = 10000;
 
+    // Both branches persist the JSON view, never the live object: a compiled
+    // request carries non-JSON members (the kv-unified `onCacheWireReceipt`
+    // hook is a function) and Chronicle's JSON bridge rejects those with
+    // "JS functions cannot be represented as a serde_json::Value" — which,
+    // thrown from the failure path, masked the failure being logged.
     if (entry.request && typeof entry.request === 'object') {
       const requestJson = JSON.stringify(entry.request);
       if (requestJson.length > BLOB_THRESHOLD) {
         const blobId = this.store.storeBlob(Buffer.from(requestJson), 'application/json');
         entryToStore.request = { blobId };
+      } else {
+        entryToStore.request = JSON.parse(requestJson);
       }
     }
 
@@ -8963,6 +11673,8 @@ export class AgentFramework {
       if (responseJson.length > BLOB_THRESHOLD) {
         const blobId = this.store.storeBlob(Buffer.from(responseJson), 'application/json');
         entryToStore.response = { blobId };
+      } else {
+        entryToStore.response = JSON.parse(responseJson);
       }
     }
 
@@ -8992,6 +11704,41 @@ export class AgentFramework {
 
     // Append one record per event — same rationale as logInference.
     this.store.appendToStateJson(PROCESS_LOG_ID, entryToStore);
+  }
+
+  /** Forget one server's RFC-008 class declarations (see the close handler). */
+  private dropMcplToolClasses(serverId: string): void {
+    // Tolerate partially-constructed frameworks (tests build them with
+    // Object.create): nothing cached means nothing to forget.
+    if (!this.mcplToolClasses?.size) return;
+    const prefix = this.mcplServerConfigs?.get(serverId)?.toolPrefix ?? `mcpl--${serverId}`;
+    for (const name of [...this.mcplToolClasses.keys()]) {
+      if (name.startsWith(`${prefix}--`)) this.mcplToolClasses.delete(name);
+    }
+  }
+
+  /**
+   * RFC-007/RFC-008: what tools/lifecycle says about a model-facing tool —
+   * its effective class, and for MCPL tools the providing connection and
+   * the server's own tool name. Host knowledge (built-in table, embedding
+   * host's table) applies only to tools the host implements; an MCPL tool's
+   * class comes from an operator override or its server's declaration.
+   */
+  private describeToolForLifecycle(tool: string): { class: ToolClass[]; serverId?: string; serverTool?: string } {
+    const mcpl = this.resolveMcplTool(tool);
+    if (mcpl) {
+      const [serverId, prefix] = mcpl;
+      const { classes } = resolveToolClass(tool, this.mcplToolClasses.get(tool), {
+        overrides: this.toolClassOverrides,
+        host: [],
+      });
+      return { class: classes, serverId, serverTool: tool.slice(prefix.length + 2) };
+    }
+    const { classes } = resolveToolClass(tool, undefined, {
+      overrides: this.toolClassOverrides,
+      host: this.hostToolClasses,
+    });
+    return { class: classes };
   }
 
   /**
@@ -9098,11 +11845,11 @@ export class AgentFramework {
       return;
     }
 
-    // Route synthesized 'think' (private reasoning) and 'skip_reply' (deliberate
-    // stay-silent) tools — handled by the channel registry like the other
+    // Route synthesized 'think' (private reasoning), 'journal' (private
+    // long-form notes) and 'skip_reply' (deliberate stay-silent) tools — handled by the channel registry like the other
     // synthesized channel tools, but they aren't `channel_`-prefixed so they
     // need an explicit route here.
-    if ((enrichedCall.name === 'think' || enrichedCall.name === 'skip_reply') && this.channelRegistry) {
+    if ((enrichedCall.name === 'think' || enrichedCall.name === 'journal' || enrichedCall.name === 'skip_reply') && this.channelRegistry) {
       // skip_reply(wake_in_seconds): arm a gate self-wake so "not replying
       // NOW" can also mean "back in a moment" — ends the turn, then wakes
       // the agent after N seconds unless something else wakes it first
@@ -9198,6 +11945,8 @@ export class AgentFramework {
       })
       .catch((error) => {
         const err = error instanceof Error ? error : new Error(String(error));
+        // RFC-007: the module threw — the host could not obtain a result.
+        this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
         this.emitTrace({
           type: 'tool:failed',
           module: moduleName,
@@ -9234,6 +11983,22 @@ export class AgentFramework {
        * this is reachable from timer callbacks that may outlive an agent).
        */
       forAgent?: string;
+      /**
+       * Set when the message is being flushed FROM the durable deferred
+       * queue: it is the entry's one durable identity. A write stamps it
+       * into `metadata.deferredWriteId` (boot dedup); a re-deferral moves
+       * the same logical entry back to pending under the same id instead of
+       * minting a second, independently replayable one.
+       */
+      deferredWriteId?: string;
+      /** Out-param: where the message landed (RFC-006 needs to find it again). */
+      placement?: { agent?: string; messageId?: MessageId; deferredId?: string };
+      /**
+       * RFC-006 assembly: the named agent's turn is alive but its compile has
+       * not run yet (the same window the turn-start deferred flush writes
+       * in). A message for THAT agent is stored directly instead of deferred.
+       */
+      bypassDeferralFor?: string;
     }
   ): MessageId {
     // Route to the named agent, else the primary (not ephemeral subagents).
@@ -9269,6 +12034,10 @@ export class AgentFramework {
     // their own wake), at the agent's next tool boundary (where they are
     // ALSO injected into the live stream — hear-while-acting), or in
     // driveStream's finally when the turn ends.
+    // Quiesce (issue #122): the window exists to run compression/refold
+    // against a FROZEN context — module events and api message.send must not
+    // append mid-surgery. Deferred here, flushed by resume(). tool_result
+    // still lands (a draining turn's continuation depends on it).
     const hasToolResult = content.some(b => b.type === 'tool_result');
     // Explicitly-targeted deliveries scope the tool-cycle check to the
     // target (pendingAssistantBlocks is keyed by agent); the default path
@@ -9279,15 +12048,34 @@ export class AgentFramework {
       : this.pendingAssistantBlocks.size > 0;
     if (
       !hasToolResult &&
-      (midToolCycle ||
+      opts?.bypassDeferralFor !== agent.name &&
+      (this.quiesced ||
+        midToolCycle ||
         this.activeTurnTokens.has(agent.name) ||
         this.activeStreams.has(agent.name))
     ) {
-      this.deferredMessages.push({ participant, content, metadata, forAgent: opts?.forAgent });
+      // A re-deferral of a drained entry keeps its id and leaves the un-acked
+      // set: one logical message, one durable identity — never two entries.
+      const id = opts?.deferredWriteId ?? randomUUID();
+      let seq: number | undefined;
+      if (opts?.deferredWriteId) {
+        const prior = this.unackedDeferredWrites.find((m) => m.id === id);
+        seq = prior?.seq;
+        this.unackedDeferredWrites = this.unackedDeferredWrites.filter((m) => m.id !== id);
+      }
+      this.deferredMessages.push({ id, seq: seq ?? ++this.deferredSeq, participant, content, metadata, forAgent: opts?.forAgent });
+      if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
+      if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.deferredId = id; }
       return '' as MessageId; // Deferred — flushed at the target's next boundary
     }
 
-    return agent.getContextManager().addMessage(participant, content, metadata);
+    const stored = agent.getContextManager().addMessage(
+      participant,
+      content,
+      opts?.deferredWriteId ? withDeferredWriteId(metadata, opts.deferredWriteId) : metadata,
+    );
+    if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; }
+    return stored;
   }
 
   /**
@@ -9296,6 +12084,9 @@ export class AgentFramework {
    * targets' messages queued for their own boundaries.
    */
   private drainDeferredFor(agentName: string): Array<{
+    /** Durable identity — every write of this entry must carry it
+     *  (`withDeferredWriteId` / `opts.deferredWriteId`). */
+    id: string;
     participant: string;
     content: ContentBlock[];
     metadata?: MessageMetadata;
@@ -9309,6 +12100,12 @@ export class AgentFramework {
       (target === agentName ? mine : rest).push(msg);
     }
     this.deferredMessages = rest;
+    mine.sort(bySeq);
+    // The drained messages are about to be written by the caller; they stay
+    // in the DURABLE queue (as un-acked) until the caller's
+    // ackDeferredWrites() has synced the chronicle. Removing them here would
+    // acknowledge before the write is durable.
+    this.handOffDeferredWrites(mine);
     return mine;
   }
 
@@ -9458,6 +12255,8 @@ export class AgentFramework {
             auxiliaryInFlight: gate?.auxiliaryInFlight ?? 0,
             auxiliaryDeferred: gate?.deferredAuxiliary ?? 0,
             cooldownUntil: cooldown?.until ?? null,
+            cooldownReason: cooldown?.reason ?? null,
+            hostHold: cooldown?.hostHoldError !== undefined,
             heldRequests: cooldown?.heldRequests.length ?? 0,
             lastRecovery: this.providerAccelerationLastRecovery?.get(name) ?? null,
           };
@@ -9587,24 +12386,27 @@ export class AgentFramework {
    * quarantine, OverBudget drain kick) gate on `errorType`, so classification
    * drift between sites would silently disable a safety net.
    *
-   * context-manager's OverBudgetError is recognized by `err.name`: CM does not
-   * export the class from its package root, so a cross-package `instanceof` is
-   * unavailable — but `name` is set in its constructor and survives the package
-   * boundary. Deliberately NOT a message match: the message wording belongs to
-   * CM and can be reworded without warning.
+   * context-manager's refusal errors are matched by a real `instanceof` since
+   * CM exports them from its package root (context-manager#41 / #71; floor
+   * `^0.7.0`, ours is higher). The `err.name` comparison stays as a FALLBACK
+   * only: a deployment that ends up with two CM copies (a peer package
+   * pinning a different version) constructs errors from a different class
+   * object, and `name` — set in the constructor — survives that boundary.
+   * Deliberately NOT a message match: the message wording belongs to CM and
+   * can be reworded without warning.
    */
   private classifyInferenceError(err: Error): { retryable?: boolean; errorType?: string } {
     if (err instanceof MembraneError) {
       return { retryable: err.retryable, errorType: err.type };
     }
-    if (err.name === 'OverBudgetError') {
+    if (err instanceof OverBudgetError || err.name === 'OverBudgetError') {
       return { errorType: 'over_budget' };
     }
     // context-manager's fatal coverage invariant (fix/coverage-invariant-fatal,
     // 2026-07-26): a compile REFUSES rather than shipping a context with
     // silently-dropped messages. Recovery is identical to over_budget — kick
     // the compression drain so summaries cover the un-represented span.
-    if (err.name === 'UncoveredDropError') {
+    if (err instanceof UncoveredDropError || err.name === 'UncoveredDropError') {
       return { errorType: 'context_refusal' };
     }
     return {};
@@ -9811,6 +12613,11 @@ export class AgentFramework {
     this.mcplServerRegistry = new McplServerRegistry();
     this.featureSetManager = new FeatureSetManager();
     this.hookOrchestrator = new HookOrchestrator(this.mcplServerRegistry, this.featureSetManager);
+    this.toolLifecycleEmitter = new ToolLifecycleEmitter({
+      observers: () => this.mcplServerRegistry?.getAllServers() ?? [],
+      configFor: (serverId) => this.mcplServerConfigs.get(serverId)?.toolLifecycle,
+      describe: (tool) => this.describeToolForLifecycle(tool),
+    });
 
     // Build prefix map and store configs for tool routing
     for (const config of serverConfigs) {
@@ -9825,11 +12632,13 @@ export class AgentFramework {
       ?? (this.eventGate ? this.eventGate.asShouldTriggerCallback() : undefined);
 
     // Push events handler (Step 6)
+    this.initializePushCoalescer();
     this.pushHandler = new PushHandler(
       this.featureSetManager,
       (event) => this.pushEvent(event as unknown as ProcessEvent),
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
       triggerFilter,
+      (serverId, params, event) => this.handleCoalescedPush(serverId, params, event),
     );
 
     // Server-initiated inference router (Step 6)
@@ -9859,6 +12668,8 @@ export class AgentFramework {
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
       {
         store: this.store,
+        handleCoalescedIncoming: (serverId, message, event) =>
+          this.handleCoalescedIncoming(serverId, message, event as CoalescedChannelEvent),
         sendTypingFn: (serverId, channelId, metadata, op) => {
           const server = this.mcplServerRegistry!.getServer(serverId);
           if (server) {
@@ -9933,11 +12744,17 @@ export class AgentFramework {
     // implemented for years — are declared (AUDIT-001/issue #76 item 12).
     this.mcplHostCapabilities = {
       version: '0.5',
+      // RFC-006 (mcpl PR #5, revision 7): both lanes, deferred rendering,
+      // channel-scoped pushes, one-hour retry window.
+      eventCoalescing: { ...PUSH_COALESCING_SUPPORT },
       pushEvents: true,
       contextHooks: {
         beforeInference: true,
       },
       inferenceLifecycle: true,
+      // RFC-007: tools/lifecycle (metadata, and requested argument fields
+      // under their own grant) plus the tools/observe filter.
+      toolLifecycle: { observe: true, inputs: true },
       // modelInfo is NOT advertised: §12.2's result requires all four of
       // {id, vendor, contextWindow, capabilities} and the host has no
       // truthful source for contextWindow/capabilities (grep: none exists).
@@ -10300,8 +13117,21 @@ export class AgentFramework {
     for (const connection of this.mcplServerRegistry?.getAllServers() ?? []) {
       // ready() can synchronously flush a nested list-change notification that
       // installs a newer global generation. Never let this older completion
-      // release any remaining server behind that newer gate.
+      // release any remaining server behind that newer gate. (The quiesce
+      // check sits AFTER this guard: readyControlPlane can also synchronously
+      // flush a control event that installs a newer barrier.)
       if (this.discordAwarenessBarrier !== null) return false;
+      // Host quiesce (issue #122): this is the single point every barrier
+      // completion and reconnect flow funnels through, so holding here keeps
+      // data planes paused across awareness drains and reconnects for the
+      // whole window. Control planes come up normally (host/command rides the
+      // control plane, so resume stays deliverable); resume() performs the
+      // real ready() flush through this same funnel once its feasibility gate
+      // passes and the flag is cleared.
+      if (this.quiesced) {
+        connection.readyControlPlane();
+        continue;
+      }
       connection.ready();
     }
     return this.discordAwarenessBarrier === null;
@@ -10807,6 +13637,13 @@ export class AgentFramework {
     /** Host-owned authority; deliberately separate from the portable grant. */
     allowHostCommands: boolean;
     /**
+     * RFC-007 §10: the server's current tools/observe filter — its own
+     * statement of which calls and argument fields it uses, shown next to
+     * the grant so an operator can narrow toolLifecycle.inputs to match. It
+     * confers nothing. Null = no filter (granted calls, metadata only).
+     */
+    toolObserveFilter: import('./mcpl/tool-lifecycle.js').ToolObserveRule[] | null;
+    /**
      * Per-transport §17 facts about the last manifest this host fetched and
      * acted on. The revision is server-authored and equality-only; these are
      * not the server's manifestChanged announcements.
@@ -10824,6 +13661,7 @@ export class AgentFramework {
       toolPrefix: string; toolCount: number; policyEstablished: boolean;
       effectiveGrant: string[]; maskedCapabilities: string[];
       deniedCapabilities: string[]; allowHostCommands: boolean;
+      toolObserveFilter: import('./mcpl/tool-lifecycle.js').ToolObserveRule[] | null;
       manifestState: {
         lastValidatedRevision: string | null;
         lastFetchedAt: number | null;
@@ -10846,6 +13684,7 @@ export class AgentFramework {
         maskedCapabilities: [...(connection?.droppedCapabilities ?? [])].sort(),
         deniedCapabilities: [...(connection?.grant.deniedPaths ?? [])].sort(),
         allowHostCommands: config.allowHostCommands === true,
+        toolObserveFilter: connection?.toolObserveFilter ?? null,
         manifestState: connection
           ? { ...connection.manifestState }
           : { lastValidatedRevision: null, lastFetchedAt: null, lastNegotiatedAt: null },
@@ -10884,7 +13723,7 @@ export class AgentFramework {
     ) => {
       const barrier = this.discordAwarenessBarrier;
       if (barrier) await barrier.promise;
-      this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
+      await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
     });
 
     // Handle server-initiated inference requests (Step 6)
@@ -10892,6 +13731,11 @@ export class AgentFramework {
       params: McplInferenceRequestParams,
       responder?: { id: string | number; respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
+      // RFC-006 §5.3 / SPEC §10.7: no inference from inside a render.
+      if (this.pushCoalescer?.isRendering(connection.id)) {
+        responder?.respondError(-32600, 'Cannot request inference while push/render is in progress');
+        return;
+      }
       if (this.inferenceRouter && responder) {
         const barrier = this.discordAwarenessBarrier;
         if (barrier) await barrier.promise;
@@ -10942,6 +13786,23 @@ export class AgentFramework {
       });
     });
 
+    // RFC-007 §6: the server's filter over tools/lifecycle. Admission already
+    // required toolLifecycle.observe (-32002 otherwise). Validation failures
+    // leave the previous filter in force (§6.6).
+    connection.on('tools-observe', (
+      params: unknown,
+      responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void },
+    ) => {
+      const parsed = parseToolObserveParams(params);
+      if (!parsed.ok) {
+        if (responder?.respondError) responder.respondError(-32602, parsed.message, parsed.data);
+        else console.error(`[mcpl] ${connection.id}: tools/observe rejected — ${parsed.message}`);
+        return;
+      }
+      connection.toolObserveFilter = parsed.rules;
+      responder?.respond({});
+    });
+
     connection.on('model-info', (
       _params: unknown,
       responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void },
@@ -10965,7 +13826,7 @@ export class AgentFramework {
     ) => {
       const barrier = this.discordAwarenessBarrier;
       if (barrier) await barrier.promise;
-      this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
+      await this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
     });
 
     // Handle host-level admin commands from a surface (e.g. Discord /undo)
@@ -11128,6 +13989,10 @@ export class AgentFramework {
     // disconnectMcplServer, which deletes the trees explicitly.
     connection.on('close', (code?: number | null, signal?: string | null) => {
       this.featureSetManager?.removeServer(connection.id);
+      // RFC-008: a closed provider's class hints are stale — on reconnect it
+      // may class its tools differently. Until the next tools/list its tools
+      // are unclassed, the restrictive answer (RFC-007 §4.3).
+      this.dropMcplToolClasses(connection.id);
       this.emitTrace({
         type: 'mcpl:server-closed',
         serverId: connection.id,
@@ -11148,6 +14013,7 @@ export class AgentFramework {
 
     const tools: import('./types/index.js').ToolDefinition[] = [];
     const toolFeatureSets = new Map<string, string>();
+    const toolClasses = new Map<string, ToolClass[]>();
 
     for (const server of this.mcplServerRegistry.getAllServers()) {
       const config = this.mcplServerConfigs.get(server.id);
@@ -11159,8 +14025,12 @@ export class AgentFramework {
           const namespacedName = `${prefix}--${tool.name}`;
           const attributedTool = tool as typeof tool & {
             featureSet?: unknown;
-            _meta?: { featureSet?: unknown };
+            _meta?: { featureSet?: unknown; [key: string]: unknown };
           };
+          // RFC-008: the server's class hint for this tool. Never shown to
+          // the model (the definition below is unchanged by it).
+          const declaredClasses = parseDeclaredClasses(attributedTool._meta, namespacedName);
+          if (declaredClasses) toolClasses.set(namespacedName, declaredClasses);
           const featureSet = typeof attributedTool.featureSet === 'string'
             ? attributedTool.featureSet
             : typeof attributedTool._meta?.featureSet === 'string'
@@ -11184,6 +14054,7 @@ export class AgentFramework {
 
     this.mcplTools = tools;
     this.mcplToolFeatureSets = toolFeatureSets;
+    this.mcplToolClasses = toolClasses;
   }
 
   /**
@@ -11249,6 +14120,8 @@ export class AgentFramework {
     const server = this.mcplServerRegistry!.getServer(serverId);
 
     if (!server) {
+      // RFC-007: refused before executing — no lifecycle events.
+      this.toolLifecycleEmitter?.refuse(agentName, call.id);
       this.pushEvent({
         type: 'tool-result',
         callId: call.id,
@@ -11261,6 +14134,7 @@ export class AgentFramework {
 
     const config = this.mcplServerConfigs.get(serverId);
     if (!isToolAllowed(toolName, config)) {
+      this.toolLifecycleEmitter?.refuse(agentName, call.id);
       this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: 'denied by tool policy' });
       this.pushEvent({
         type: 'tool-result',
@@ -11437,6 +14311,8 @@ export class AgentFramework {
       .catch((error) => {
         const err = error instanceof Error ? error : new Error(String(error));
         this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: err.message, stack: err.stack });
+        // RFC-007: transport error, closed connection or timeout — no result.
+        this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
 
         this.pushEvent({
           type: 'tool-result',
@@ -11463,6 +14339,8 @@ export class AgentFramework {
     const home = this.conversationAgentHomes.get(agentName);
     if (home) {
       const reject = (error: string): void => {
+        // RFC-007: the guard refuses before the tool runs — no lifecycle events.
+        this.toolLifecycleEmitter?.refuse(agentName, call.id);
         this.emitTrace({
           type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id,
           error: `conversation agent ${agentName}: ${error}`,
@@ -11546,6 +14424,7 @@ export class AgentFramework {
       .catch((error) => {
         const err = error instanceof Error ? error : new Error(String(error));
         this.emitTrace({ type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id, error: err.message });
+        this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
@@ -12628,6 +15507,7 @@ export class AgentFramework {
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
       this.emitTrace({ type: 'tool:failed', module: 'gate', tool: call.name, callId: call.id, error: err.message });
+      this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
       result = { success: false, error: err.message, isError: true };
     }
     this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'gate', result });
@@ -12652,6 +15532,7 @@ export class AgentFramework {
       .catch((error) => {
         const err = error instanceof Error ? error : new Error(String(error));
         this.emitTrace({ type: 'tool:failed', module: 'gate', tool: call.name, callId: call.id, error: err.message });
+        this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
