@@ -19,16 +19,23 @@ export class ScriptRun {
     completion: Promise<ExecResult>,
     onComplete: (result: ExecResult, notify: boolean, observed: boolean) => void,
   ) {
-    void completion.then((result) => {
+    const settle = (result: ExecResult) => {
       this.result = result;
       const observed = this.waiters.size > 0;
       for (const finish of [...this.waiters]) finish();
       onComplete(result, this.notifyOnCompletion && !observed, observed);
+    };
+    void completion.then(settle, (err) => {
+      // exec never rejects by contract; this is the belt-and-suspenders, so a
+      // rejection can't leave the record 'running' (and the context busy) forever.
+      console.error(`[pytc] exec rejected: ${String(err)}`);
+      settle({ stdout: '', stderr: String(err), returnCode: 1, aborted: true });
     });
   }
 
   get observing(): boolean { return this.waiters.size > 0; }
 
+  /** Wait up to `waitMs` for the result; `Infinity` waits until the script ends. */
   observe(waitMs: number, onTimeout: TimeoutPolicy): Promise<ScriptObservation> {
     if (this.result) return Promise.resolve({ result: this.result, endTurn: false });
     return new Promise((resolve) => {
@@ -41,7 +48,7 @@ export class ScriptRun {
       };
       this.waiters.add(finish);
       if (waitMs === 0) finish(onTimeout === 'end_turn');
-      else timer = setTimeout(() => finish(onTimeout === 'end_turn'), waitMs);
+      else if (Number.isFinite(waitMs)) timer = setTimeout(() => finish(onTimeout === 'end_turn'), waitMs);
     });
   }
 

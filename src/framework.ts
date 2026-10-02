@@ -104,6 +104,11 @@ import { PyRunner, buildInjectedTools, formatLimit } from './code-execution/py-r
 import {
   buildCodeExecutionToolDefinition,
   CODE_EXECUTION_TOOL_NAME,
+  DEFAULT_WAIT_MS,
+  isValidWaitMs,
+  MAX_ANNOUNCED_RESULTS,
+  MAX_RETAINED_RESULTS,
+  MAX_WAIT_MS,
   scriptTimeLimits,
   validateCodeExecutionConfig,
 } from './code-execution/tool-definition.js';
@@ -586,7 +591,8 @@ export interface HostModeStatus {
   reason?: string;
   since?: number;
   /** True when no turn is alive (activeTurnTokens empty — the token spans
-   * dequeue → settled teardown, strictly wider than activeStreams). */
+   * dequeue → settled teardown, strictly wider than activeStreams) and no
+   * foreground script is still running. */
   drained: boolean;
   activeTurns: number;
   /** Wakes that own provider admission while waiting for an in-flight
@@ -603,6 +609,11 @@ export interface HostModeStatus {
    * them — they hold no turn token, so drain doesn't wait for them. Reported
    * so the operator sees what is still acting during the window. */
   backgroundScripts: number;
+  /** Foreground code-execution scripts still running, including ones that
+   * outlived the turn that started them (the call returned a running
+   * script_id). They are turn work without a turn token: `drained` is false
+   * until they end, and abandon stops them. */
+  foregroundScripts: number;
   /** Context writes (module events, api message.send) withheld because the
    * host is quiesced. Persisted while quiesced and flushed by resume(). */
   deferredWrites: number;
@@ -938,6 +949,10 @@ interface CodeExecutionRecord {
   status: 'running' | 'finished' | 'died' | 'cancelled';
   /** Set when cancel/dispose already settled this script (suppresses wakes). */
   cancelled: boolean;
+  /** A completion notice told the agent to retrieve this result. */
+  announced?: boolean;
+  /** The agent has received this result through an observation. */
+  retrieved?: boolean;
 }
 
 interface EphemeralRun {
@@ -2805,6 +2820,8 @@ export class AgentFramework {
   // paused data planes; gate debounces buffer in the gate. Background
   // code-execution scripts are NOT stopped (they hold no turn token) — they
   // are reported in the status so the operator sees what still acts.
+  // Foreground scripts are turn work even after their call returned a running
+  // script_id: drain waits for them and abandon stops them.
   //
   // NOTE: do not call quiesce() from inside a queue event handler — the drain
   // wait depends on the event loop continuing to run.
@@ -2825,18 +2842,26 @@ export class AgentFramework {
     return n;
   }
 
+  /** Foreground scripts still running, whether or not a turn still observes them. */
+  private runningForegroundScripts(): CodeExecutionRecord[] {
+    return [...this.codeExecutionScripts.values()]
+      .filter((record) => record.mode === 'foreground' && record.status === 'running');
+  }
+
   getHostModeStatus(): HostModeStatus {
     const parkedAdmissions = this.parkedAdmissionCount();
+    const foregroundScripts = this.runningForegroundScripts().length;
     return {
       quiesced: this.quiesced,
       ...(this.quiesceReason ? { reason: this.quiesceReason } : {}),
       ...(this.quiescedAt !== undefined ? { since: this.quiescedAt } : {}),
-      drained: this.activeTurnTokens.size === 0 && parkedAdmissions === 0,
+      drained: this.activeTurnTokens.size === 0 && parkedAdmissions === 0 && foregroundScripts === 0,
       activeTurns: this.activeTurnTokens.size,
       parkedAdmissions,
       gatedRequests: this.pendingRequests.filter((r) => !isTurnContinuation(r.reason)).length,
       backgroundScripts: [...this.codeExecutionScripts.values()]
         .filter((record) => record.mode === 'background' && record.status === 'running').length,
+      foregroundScripts,
       deferredWrites: this.deferredMessages.length,
       ...(this.lastUnabandonable.length > 0 ? { unabandonable: [...this.lastUnabandonable] } : {}),
     };
@@ -2869,12 +2894,12 @@ export class AgentFramework {
       // out undrained must be escalatable with a second quiesce({abandon})
       // without resume()+re-quiesce (which would reopen data planes and
       // release parked wakes mid-surgery).
-      if (opts?.abandon && this.activeTurnTokens.size > 0) {
+      if (opts?.abandon && (this.activeTurnTokens.size > 0 || this.runningForegroundScripts().length > 0)) {
         const unabandonable = await this.abandonActiveTurns();
         this.emitTrace({
           type: 'host:quiesce',
           ...(this.quiesceReason ? { reason: this.quiesceReason } : {}),
-          drained: this.activeTurnTokens.size === 0,
+          drained: this.activeTurnTokens.size === 0 && this.runningForegroundScripts().length === 0,
           activeTurns: this.activeTurnTokens.size,
           abandoned: true,
           ...(unabandonable.length > 0 ? { unabandonable } : {}),
@@ -2918,7 +2943,8 @@ export class AgentFramework {
     // continuation's quiesce recheck requeues it — wait for that to happen).
     while (
       this.quiesced &&
-      (this.activeTurnTokens.size > 0 || this.parkedAdmissionCount() > 0) &&
+      (this.activeTurnTokens.size > 0 || this.parkedAdmissionCount() > 0 ||
+        this.runningForegroundScripts().length > 0) &&
       Date.now() < deadline
     ) {
       await new Promise((resolve) => setTimeout(resolve, 250));
@@ -2935,7 +2961,7 @@ export class AgentFramework {
 
     let abandoned = false;
     let unabandonable: string[] = [];
-    if (this.activeTurnTokens.size > 0 && opts?.abandon) {
+    if ((this.activeTurnTokens.size > 0 || this.runningForegroundScripts().length > 0) && opts?.abandon) {
       abandoned = true;
       unabandonable = await this.abandonActiveTurns();
       if (!this.quiesced) return this.getHostModeStatus();
@@ -2956,6 +2982,7 @@ export class AgentFramework {
         ? `[host-mode] quiesced — drained, ${status.gatedRequests} wake(s) parked`
         : `[host-mode] quiesced but drain ${abandoned ? 'needed abandon and' : 'timed out —'} ` +
           `${status.activeTurns} turn(s) still alive` +
+          (status.foregroundScripts > 0 ? `, ${status.foregroundScripts} foreground script(s) still running` : '') +
           (status.parkedAdmissions > 0
             ? `, ${status.parkedAdmissions} wake(s) parked on provider admission`
             : ''),
@@ -2991,9 +3018,23 @@ export class AgentFramework {
         );
       }
     }
+    // Foreground scripts whose call already returned have no stream to
+    // cancel; stop them directly. Their owner hears at resume (the completion
+    // notice is deferred like any other write). An observed script stops with
+    // its turn (abortAgentScript on the cancelled stream); background
+    // watchers stay.
+    for (const record of this.runningForegroundScripts()) {
+      if (record.run.observing) continue;
+      console.error(`[host-mode] stopping foreground script ${record.id} for ${record.agentName}`);
+      record.runner.abort('abandoned by operator quiesce');
+    }
     // Bounded grace for the cancelled streams' teardown to settle.
     const grace = Date.now() + 10_000;
-    while (this.quiesced && this.activeTurnTokens.size > 0 && Date.now() < grace) {
+    while (
+      this.quiesced &&
+      (this.activeTurnTokens.size > 0 || this.runningForegroundScripts().length > 0) &&
+      Date.now() < grace
+    ) {
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
     // Only turns still alive after the grace are worth reporting.
@@ -10754,16 +10795,22 @@ export class AgentFramework {
       on_timeout?: unknown;
     };
 
-    const waitMs = input.wait_ms ?? this.codeExecutionConfig?.foregroundWaitMs ?? 10_000;
-    if (typeof waitMs !== 'number' || !Number.isInteger(waitMs) || waitMs < 0 || waitMs > 60_000) {
-      return { success: false, error: 'wait_ms must be an integer from 0 to 60000', isError: true };
+    // The configured default was validated when the framework was created.
+    if (input.wait_ms !== undefined && !isValidWaitMs(input.wait_ms)) {
+      return { success: false, error: `wait_ms must be an integer from 0 to ${MAX_WAIT_MS}`, isError: true };
     }
+    const waitMs = input.wait_ms ?? this.codeExecutionConfig?.foregroundWaitMs ?? DEFAULT_WAIT_MS;
     const onTimeout = input.on_timeout ?? 'continue';
     if (onTimeout !== 'continue' && onTimeout !== 'end_turn') {
       return { success: false, error: 'on_timeout must be continue or end_turn', isError: true };
     }
 
-    if (onTimeout === 'end_turn' && (!this.agents.has(agentName) || this.ephemeralRuns.has(agentName))) {
+    // An ephemeral's scripts are disposed with its run, so it can never
+    // receive a completion notice: it waits for a foreground script to end,
+    // as every caller did before execution and observation were separated.
+    const ephemeral = !this.agents.has(agentName) || this.ephemeralRuns.has(agentName);
+    const foregroundWaitMs = ephemeral ? Infinity : waitMs;
+    if (onTimeout === 'end_turn' && ephemeral) {
       return { success: false, isError: true, error: 'end_turn requires a persistent registered agent that can receive the completion wake' };
     }
 
@@ -10789,9 +10836,11 @@ export class AgentFramework {
       }
       const record = this.codeExecutionScripts.get(input.script_id);
       if (!record || record.agentName !== agentName) {
-        return { success: false, error: `no script '${input.script_id}'`, isError: true };
+        return { success: false, error: `no script '${input.script_id}' (unknown, or its result is no longer retained)`, isError: true };
       }
-      if (input.action === 'wait') return this.observeCodeExecution(record, waitMs, onTimeout);
+      if (input.action === 'wait') {
+        return this.observeCodeExecution(record, record.mode === 'foreground' ? foregroundWaitMs : waitMs, onTimeout);
+      }
       if (record.status === 'running') {
         record.wakeAbort.abort();
         record.cancelled = true;
@@ -10868,7 +10917,7 @@ export class AgentFramework {
       callId: record.id, input: { lines: record.code.split('\n').length } });
     record.run = new ScriptRun(runner.exec(input.code, injected, undefined, { deadlineMs: timeLimitMs ?? limits.defaultMs }), (exec, notify, observed) =>
       this.settleCodeExecution(record, exec, notify, observed));
-    return this.observeCodeExecution(record, waitMs, onTimeout);
+    return this.observeCodeExecution(record, foregroundWaitMs, onTimeout);
   }
 
   private async observeCodeExecution(
@@ -10878,6 +10927,7 @@ export class AgentFramework {
     const exec = observed.result;
     const endTurn = observed.endTurn || record.endTurn;
     record.endTurn = false;
+    if (exec) record.retrieved = true;
     return {
       success: true, isError: false,
       data: {
@@ -11036,8 +11086,13 @@ export class AgentFramework {
    * wake_agent() from a background script: enforce the per-script wake cap
    * and rate floor (delay, not drop — the script awaits the ack), then
    * inject the provenance envelope + payload and request inference.
-   * Resolves null on delivery; an error string refuses the wake (raises
-   * RuntimeError inside the script).
+   * Resolves null once the envelope is in the agent's context or queued
+   * behind its current turn (addMessage defers every write while a turn is
+   * alive); an error string refuses the wake (raises RuntimeError inside the
+   * script). The ack does not wait for a queued envelope to land: that would
+   * hold the watcher until the turn's next boundary, and an agent observing
+   * its own background script would always time out. A queued write the
+   * store later rejects is logged and dropped, as for every deferred writer.
    */
   private async handleScriptWake(
     record: CodeExecutionRecord,
@@ -11121,10 +11176,12 @@ export class AgentFramework {
       const elapsedMin = Math.round((Date.now() - record.startedAt) / 60_000);
       const envelope =
         `[${record.mode} script ${record.id}] Script ${record.status === 'died' ? 'DIED' : 'finished'} ${elapsedMin}m after start ` +
-        `(return_code=${exec.returnCode}). Retrieve the retained result with code_execution action=wait, script_id=${record.id}.\n` +
+        `(return_code=${exec.returnCode}). The full result is kept until you retrieve it with code_execution action=wait, script_id=${record.id}.\n` +
         `Last output:\n${tail || '(none)'}\n` +
         (record.logPath ? `Full journal: workspace file ${record.logPath}` : '');
-      this.injectScriptWake(record, envelope);
+      const error = this.injectScriptWake(record, envelope, { system: true });
+      if (error) console.error(`[pytc:${record.agentName}:${record.id}] completion notice not delivered: ${error}`);
+      else record.announced = true;
     }
     // Refresh insertion order on settlement so a long-running older job
     // isn't immediately evicted by five newer jobs that finished before it.
@@ -11132,10 +11189,24 @@ export class AgentFramework {
       this.codeExecutionScripts.delete(record.id);
       this.codeExecutionScripts.set(record.id, record);
     }
-    // Keep a short memory of settled scripts for list/wait, then drop.
+    this.trimSettledScripts(record.agentName);
+  }
+
+  /**
+   * Keep a short memory of settled scripts for list/wait, then drop. A result
+   * a completion notice told the agent to retrieve is kept until it is
+   * retrieved (bounded, so an agent that never retrieves can't grow memory);
+   * the rest are kept most-recent-first.
+   */
+  private trimSettledScripts(agentName: string): void {
     const settled = [...this.codeExecutionScripts.values()]
-      .filter((s) => s.agentName === record.agentName && s.status !== 'running');
-    for (const old of settled.slice(0, Math.max(0, settled.length - 5))) {
+      .filter((s) => s.agentName === agentName && s.status !== 'running');
+    const awaited = settled.filter((s) => s.announced && !s.retrieved);
+    const others = settled.filter((s) => !(s.announced && !s.retrieved));
+    for (const old of [
+      ...awaited.slice(0, Math.max(0, awaited.length - MAX_ANNOUNCED_RESULTS)),
+      ...others.slice(0, Math.max(0, others.length - MAX_RETAINED_RESULTS)),
+    ]) {
       this.codeExecutionScripts.delete(old.id);
     }
   }
@@ -11147,16 +11218,18 @@ export class AgentFramework {
    * authority); it enters tagged so gate policies could be taught about it
    * later if that ever needs revisiting.
    */
-  private injectScriptWake(record: CodeExecutionRecord, envelope: string): string | null {
+  private injectScriptWake(record: CodeExecutionRecord, envelope: string, opts?: { system?: boolean }): string | null {
     if (!this.agents.has(record.agentName)) return 'script owner is no longer registered';
     try {
       const scriptWakeId = randomUUID();
+      // Completion notices are machinery (`system`); a wake_agent payload is
+      // the script speaking to its agent, so it stays conversational.
       const messageId = this.addMessage('user', [{ type: 'text', text: envelope }], {
         source: 'background-script',
         scriptId: record.id,
         scriptWakeId,
         tags: ['script:wake'],
-        system: true,
+        ...(opts?.system ? { system: true } : {}),
       }, { forAgent: record.agentName });
       this.pendingRequests.push({
         agentName: record.agentName,
@@ -11339,7 +11412,13 @@ export class AgentFramework {
         onToolCall: (toolName, args) => {
           const record = [...this.codeExecutionScripts.values()].find(s =>
             s.agentName === agentName && s.mode === 'foreground' && s.status === 'running');
-          return this.handleScriptToolCall(agentName, toolName, args, () => { if (record) record.endTurn = true; });
+          // An inner end-turn ends only a turn that is still waiting on this
+          // script. Once the call has returned "running", that turn has moved
+          // on; a late request belongs to no turn and is dropped rather than
+          // ending whichever later turn happens to retrieve the result.
+          return this.handleScriptToolCall(agentName, toolName, args, () => {
+            if (record?.run.observing) record.endTurn = true;
+          });
         },
       });
       this.codeExecutionRunners.set(agentName, runner);

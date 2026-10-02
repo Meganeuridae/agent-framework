@@ -42,8 +42,20 @@ Repeated waits refer to one execution and never replay its side effects. A
 wait already present at completion receives the result directly, suppressing
 the additional completion wake. Multiple expired waits arm one completion
 notice. The notice contains a bounded tail; the full captured result can be
-retrieved with `wait` and uses the normal spill policy. Ordinary foreground
+retrieved with `wait` and uses the normal spill policy. A result a notice
+announced is kept until the agent retrieves it (at most 20 per owner); other
+settled results are kept five deep, most recent first. Ordinary foreground
 stdout is currently available at completion, not streamed during execution.
+
+An inner tool that ends the turn (such as `skip_reply`) ends the turn that is
+waiting on the script, as before. Once the call has returned `running`, no
+turn is waiting: a later end-turn request from that script is dropped rather
+than ending whichever turn next retrieves the result. A background script's
+inner end-turn never ends a foreground call.
+
+Completion notices are system messages. A `wake_agent(payload)` message stays
+conversational input, as before this change: it is the script speaking to its
+agent.
 
 The existing foreground interpreter remains persistent and serial. A second
 run while it is busy fails with the running ID and recovery instructions.
@@ -54,9 +66,20 @@ Background crashes still notify. `list` reports both modes; the legacy
 `background_scripts` field is preserved. `cancel` stops Python explicitly.
 
 Ephemeral agents cannot request `on_timeout=end_turn`: their owner is destroyed
-when the turn ends and cannot receive the promised wake. Owner disposal cancels
-its executions and releases their interpreters. Background watchers retain the
+when the turn ends and cannot receive the promised wake. For the same reason an
+ephemeral agent's foreground call always waits until its script ends (bounded by
+the script's time limit), whatever `wait_ms` says. Owner disposal cancels its
+executions and releases their interpreters. Background watchers retain the
 existing primary-agent restriction.
+
+## Host quiesce
+
+A foreground script whose call returned `running` is still turn work, though it
+holds no turn token. Quiesce (#122) therefore keeps its guarantee: `drained` is
+false while any foreground script runs, the drain waits for them, and `abandon`
+stops them. Their owner receives the completion notice at resume, like any
+write deferred by the quiesce. Background watchers stay exempt, as before. Host
+status reports `foregroundScripts` alongside `backgroundScripts`.
 
 ## Operator interface implemented here
 
@@ -86,18 +109,24 @@ unrelated tools in the same batch. This is not a general-purpose inference reset
 - Preserve fractional seconds when sending inner-tool timeouts to Python.
 - Serialize each script's wake requests, enforcing the interval and cap under
   `asyncio.gather`; stop rate-limit waits when execution ends.
-- Acknowledge `wake_agent` only after context delivery and inference enqueue
-  succeed. Delivery failures are errors visible to Python.
+- Acknowledge `wake_agent` once its message is stored, or queued behind the
+  agent's current turn, and its inference request is enqueued. Immediate
+  delivery failures are errors visible to Python. The ack does not wait for a
+  queued message to land: that would hold the watcher until the turn's next
+  boundary, and an agent observing its own background script would always time
+  out. A queued message the store later rejects is logged and dropped, as for
+  every deferred writer.
 - Scope inner-tool end-turn requests to their execution, preventing background
   or late results from ending an unrelated foreground call.
 
 ## Limits and the next design steps
 
-Execution IDs and the five most recently settled results per owner are held in
-memory. Host restart loses them and stops Python. Completion delivery is not a
-durable receipt/outbox: storage failure is logged, and an operator can retrieve
-the result while the host remains alive. Explicit script wakes report delivery
-failure to Python. Cancellation is not rollback, and does not cancel an already
+Execution IDs and retained results are held in memory. Host restart loses them
+and stops Python. Completion delivery is not a
+durable receipt/outbox: storage failure is logged (including a notice that could
+not be delivered at all), and an operator can retrieve the result while the host
+remains alive. Explicit script wakes report immediate
+delivery failure to Python. Cancellation is not rollback, and does not cancel an already
 dispatched inner tool. There is no claim of exactly-once external effects.
 
 The next increment should give operations a bounded, cursor-addressed journal

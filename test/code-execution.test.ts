@@ -328,6 +328,42 @@ describe('PyRunner (real python3)', () => {
     } finally { runner.dispose(); }
   });
 
+  it('does not deliver a late wake acknowledgement to a replacement interpreter', async () => {
+    let refuseOld!: (error: string | null) => void;
+    let ackNew!: (error: string | null) => void;
+    let startedOld!: () => void;
+    let startedNew!: () => void;
+    const oldStarted = new Promise<void>(r => { startedOld = r; });
+    const newStarted = new Promise<void>(r => { startedNew = r; });
+    let wakes = 0;
+    const onWake = async (): Promise<string | null> => {
+      if (++wakes === 1) {
+        startedOld();
+        return new Promise<string | null>(r => { refuseOld = r; });
+      }
+      startedNew();
+      return new Promise<string | null>(r => { ackNew = r; });
+    };
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    const background = { logPath: null, lifetimeMs: 30_000, onWake };
+    try {
+      const old = runner.exec('await wake_agent("old")', [], background);
+      await oldStarted;
+      runner.abort('replace interpreter');
+      await old;
+      // The fresh interpreter numbers its wakes from w1 again.
+      const fresh = runner.exec('await wake_agent("new")\nprint("acknowledged")', [], background);
+      await newStarted;
+      refuseOld('STALE REFUSAL');
+      // Give the old refusal a chance to reach the new interpreter's w1 wake.
+      await new Promise(r => setTimeout(r, 100));
+      ackNew(null);
+      const result = await fresh;
+      assert.strictEqual(result.returnCode, 0, result.tail ?? result.stderr);
+      assert.match(result.tail ?? '', /acknowledged/);
+    } finally { runner.dispose(); }
+  });
+
   it('fails gracefully when the python binary is missing', async () => {
     const runner = new PyRunner({
       pythonPath: '/definitely/not/a/python',
@@ -499,6 +535,39 @@ describe('framework code_execution integration (real python3)', () => {
         !wireResult.content.includes('"echoed"'),
         'intermediate tool results must not reach the model-facing result',
       );
+    } finally {
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('an ephemeral agent waits for its script to finish instead of being promised a wake', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-ephemeral-wait-');
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_slow', name: 'code_execution',
+        input: { code: 'import asyncio\nawait asyncio.sleep(0.3)\nprint("ephemeral done")', wait_ms: 0 } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [new ScriptToolModule()],
+      syncIntervalMs: 0,
+      codeExecution: { enabled: true, foregroundWaitMs: 5 },
+    });
+    try {
+      const created = await framework.createEphemeralAgent({
+        name: 'helper', model: 'test-model', systemPrompt: 'Help.', allowedTools: 'all',
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      const promise = framework.runEphemeralToCompletion(created.agent, created.contextManager);
+      framework.start();
+      await promise;
+      const wire = membrane.lastStream!.receivedToolResults[0][0] as { content: string };
+      assert.match(wire.content, /ephemeral done/);
+      assert.doesNotMatch(wire.content, /Still running/);
     } finally {
       await framework.stop();
       rmSync(tempDir, { recursive: true, force: true });
@@ -731,14 +800,161 @@ describe('framework background scripts + spill (real python3)', () => {
       id: 'test', name: 'code_execution', callerAgentName: 'prime', input,
     });
     try {
-      const started = await call({ code: 'import asyncio\nawait asyncio.sleep(60)', wait_ms: 0 });
+      const started = await call({ code: 'prior = 1\nimport asyncio\nawait asyncio.sleep(60)', wait_ms: 0 });
       const id = (started.data as { script_id: string }).script_id;
       await call({ action: 'cancel', script_id: id });
       const result = await call({ action: 'wait', script_id: id });
       assert.equal((result.data as { status: string }).status, 'cancelled');
       assert.equal((result.data as { aborted: boolean }).aborted, true);
-      const next = await call({ code: 'print("fresh context")' });
-      assert.match((next.data as { stdout: string }).stdout, /fresh context/);
+      const next = await call({ code: 'print("prior" in globals())' });
+      assert.equal((next.data as { stdout: string }).stdout.trim(), 'False', 'cancel must reclaim the interpreter');
+    } finally { await framework.stop(); rmSync(tempDir, { recursive: true, force: true }); }
+  });
+
+  const until = async (cond: () => boolean | Promise<boolean>, what: string, ms = 5000) => {
+    const deadline = Date.now() + ms;
+    while (!(await cond())) {
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+      await new Promise(r => setTimeout(r, 10));
+    }
+  };
+  const statusOf = async (framework: AgentFramework, id: string) => {
+    const list = await framework.executeToolCall({ id: 'list', name: 'code_execution', callerAgentName: 'prime', input: { action: 'list' } });
+    return (list.data as { scripts: { script_id: string; status: string }[] }).scripts.find(s => s.script_id === id)?.status;
+  };
+  const idOf = (r: ToolResult) => (r.data as { script_id: string }).script_id;
+  const stdoutOf = (r: ToolResult) => (r.data as { stdout: string }).stdout.trim();
+
+  it('an inner end-turn ends only a turn that is still waiting on the script', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-late-endturn-');
+    const framework = await createBgFramework(storePath, new MockMembrane());
+    const call = (input: Record<string, unknown>) => framework.executeToolCall({
+      id: `t-${Math.random()}`, name: 'code_execution', callerAgentName: 'prime', input,
+    });
+    try {
+      framework.start();
+      const observed = await call({ code: 'await test__finish({})\nprint("observed")', wait_ms: 5000 });
+      assert.equal(stdoutOf(observed), 'observed');
+      assert.equal(observed.endTurn, true, 'the waiting call carries the end-turn');
+
+      const started = await call({ code: 'import asyncio\nawait asyncio.sleep(0.2)\nawait test__finish({})\nprint("late")', wait_ms: 0 });
+      const id = idOf(started);
+      assert.equal(started.endTurn, undefined);
+      await until(async () => (await statusOf(framework, id)) === 'finished', 'the yielded script to finish');
+      const retrieved = await call({ action: 'wait', script_id: id, wait_ms: 0 });
+      assert.equal(stdoutOf(retrieved), 'late');
+      assert.equal(retrieved.endTurn, undefined, 'a late end-turn must not end the turn that retrieves the result');
+    } finally { await framework.stop(); rmSync(tempDir, { recursive: true, force: true }); }
+  });
+
+  it("a background script's inner end-turn never ends a foreground call", async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-bg-endturn-');
+    const framework = await createBgFramework(storePath, new MockMembrane());
+    const call = (input: Record<string, unknown>) => framework.executeToolCall({
+      id: `t-${Math.random()}`, name: 'code_execution', callerAgentName: 'prime', input,
+    });
+    try {
+      framework.start();
+      const foreground = call({ code: 'import asyncio\nawait asyncio.sleep(0.5)\nprint("fg")', wait_ms: 5000 });
+      const background = await call({ background: true, code: 'await test__finish({})\nprint("bg")' });
+      const bgId = idOf(background);
+      const fg = await foreground;
+      assert.equal(stdoutOf(fg), 'fg');
+      await until(async () => (await statusOf(framework, bgId)) === 'finished', 'the background script to finish');
+      assert.equal(fg.endTurn, undefined, "the background script's end-turn must not land on the foreground call");
+    } finally { await framework.stop(); rmSync(tempDir, { recursive: true, force: true }); }
+  });
+
+  it('a failed turn stops the script it is waiting on, never one it already left running', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-abort-observed-');
+    const framework = await createBgFramework(storePath, new MockMembrane());
+    const call = (input: Record<string, unknown>) => framework.executeToolCall({
+      id: `t-${Math.random()}`, name: 'code_execution', callerAgentName: 'prime', input,
+    });
+    const streamFailed = () => (framework as unknown as { abortAgentScript(a: string, r: string): void })
+      .abortAgentScript('prime', 'stream error');
+    try {
+      const yielded = await call({ code: 'import asyncio\nawait asyncio.sleep(0.3)\nprint("survived")', wait_ms: 0 });
+      streamFailed();
+      const survived = await call({ action: 'wait', script_id: idOf(yielded), wait_ms: 5000 });
+      assert.equal(stdoutOf(survived), 'survived');
+
+      const observed = call({ code: 'import asyncio\nawait asyncio.sleep(30)', wait_ms: 30_000 });
+      const records = (framework as unknown as { codeExecutionScripts: Map<string, { status: string; run: { observing: boolean } }> }).codeExecutionScripts;
+      await until(() => [...records.values()].some(r => r.status === 'running' && r.run.observing), 'the observed script');
+      streamFailed();
+      const aborted = await observed;
+      assert.equal((aborted.data as { aborted?: boolean }).aborted, true);
+      assert.equal((aborted.data as { status: string }).status, 'died');
+    } finally { await framework.stop(); rmSync(tempDir, { recursive: true, force: true }); }
+  });
+
+  it('a pending rate-limited wake is released when its script ends', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-wake-release-');
+    const framework = await createBgFramework(storePath, new MockMembrane(), {
+      codeExecution: { wakeMinIntervalMs: 60_000 },
+    });
+    try {
+      const started = await framework.executeToolCall({ id: 'bg', name: 'code_execution', callerAgentName: 'prime',
+        input: { background: true, time_limit_ms: 1000, code: 'await wake_agent("first")\nawait wake_agent("second")' } });
+      const id = idOf(started);
+      const record = (framework as unknown as { codeExecutionScripts: Map<string, { wakes: number; wakeQueue: Promise<unknown> }> })
+        .codeExecutionScripts.get(id)!;
+      await until(() => record.wakes === 1, 'the first wake');
+      // The second wake now sits behind the 60 s floor; the 1 s limit ends the script.
+      await until(async () => (await statusOf(framework, id)) !== 'running', 'the time limit');
+      const outcome = await Promise.race([
+        record.wakeQueue.then(() => 'released'),
+        new Promise(r => setTimeout(() => r('still waiting'), 1000)),
+      ]);
+      assert.equal(outcome, 'released');
+    } finally { await framework.stop(); rmSync(tempDir, { recursive: true, force: true }); }
+  });
+
+  it('a result announced by a completion notice is kept until retrieved', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-announced-');
+    const framework = await createBgFramework(storePath, new MockMembrane());
+    const call = (input: Record<string, unknown>) => framework.executeToolCall({
+      id: `t-${Math.random()}`, name: 'code_execution', callerAgentName: 'prime', input,
+    });
+    try {
+      const id = idOf(await call({ code: 'import asyncio\nawait asyncio.sleep(0.1)\nprint("kept")', wait_ms: 0 }));
+      await until(async () => (await statusOf(framework, id)) === 'finished', 'the yielded script');
+      const notice = framework.getAgent('prime')!.getContextManager().queryMessages({}).messages
+        .find(m => (m.metadata as { scriptId?: string } | undefined)?.scriptId === id);
+      assert.ok(notice, 'a completion notice was delivered');
+      assert.match(JSON.stringify(notice.content), /kept until you retrieve it/);
+      assert.equal((notice.metadata as { system?: boolean }).system, true, 'completion notices are system messages');
+      for (let i = 0; i < 6; i++) await call({ code: `print(${i})`, wait_ms: 5000 });
+      const retrieved = await call({ action: 'wait', script_id: id, wait_ms: 0 });
+      assert.equal(stdoutOf(retrieved), 'kept', 'newer results must not evict an announced, unretrieved one');
+      // Once retrieved it is an ordinary result again and ages out.
+      for (let i = 0; i < 6; i++) await call({ code: `print(${i})`, wait_ms: 5000 });
+      assert.equal((await call({ action: 'wait', script_id: id, wait_ms: 0 })).isError, true);
+    } finally { await framework.stop(); rmSync(tempDir, { recursive: true, force: true }); }
+  });
+
+  it('quiesce drains scripts that outlived their turn; abandon stops them and spares watchers', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-quiesce-');
+    const framework = await createBgFramework(storePath, new MockMembrane());
+    const call = (input: Record<string, unknown>) => framework.executeToolCall({
+      id: `t-${Math.random()}`, name: 'code_execution', callerAgentName: 'prime', input,
+    });
+    try {
+      const fg = idOf(await call({ code: 'import asyncio\nawait asyncio.sleep(60)', wait_ms: 0 }));
+      const bg = idOf(await call({ background: true, code: 'import asyncio\nawait asyncio.sleep(60)' }));
+      const drained = await framework.quiesce({ reason: 'test', timeoutMs: 1000 });
+      assert.equal(drained.drained, false, 'a running foreground script is not quiet');
+      assert.equal(drained.foregroundScripts, 1);
+      assert.equal(drained.backgroundScripts, 1);
+      const abandoned = await framework.quiesce({ abandon: true });
+      assert.equal(abandoned.drained, true);
+      assert.equal(abandoned.foregroundScripts, 0);
+      assert.equal(abandoned.backgroundScripts, 1, 'background watchers keep running');
+      assert.equal(await statusOf(framework, fg), 'died');
+      assert.equal(await statusOf(framework, bg), 'running');
+      assert.ok(abandoned.deferredWrites >= 1, 'the owner hears about the stopped script at resume');
+      await framework.resume();
     } finally { await framework.stop(); rmSync(tempDir, { recursive: true, force: true }); }
   });
 
@@ -836,6 +1052,8 @@ describe('framework background scripts + spill (real python3)', () => {
       assert.match(text, /"found": "signal"/);
       assert.match(text, /workspace file files\/background-scripts\/bg-\d+\.log/);
       assert.match(text, /Script status: still running|Script status/);
+      assert.notEqual((wakeMessage as { metadata?: { system?: boolean } }).metadata?.system, true,
+        'a wake_agent payload is the script speaking to its agent, not a system marker');
     } finally {
       await framework.stop();
       rmSync(tempDir, { recursive: true, force: true });
@@ -1072,6 +1290,25 @@ describe('code_execution per-call time limit (time_limit_ms)', () => {
           codeExecution: { enabled: true, scriptTimeoutMs: 600_000, maxScriptTimeoutMs: 60_000 },
         }),
         /maxScriptTimeoutMs \(60000\) must be at least scriptTimeoutMs \(600000\)/,
+      );
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('an out-of-range foregroundWaitMs is refused when the framework is created', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-badwait-');
+    try {
+      await assert.rejects(
+        AgentFramework.create({
+          storePath,
+          membrane: new MockMembrane().asMembrane(),
+          agents: [],
+          modules: [],
+          syncIntervalMs: 0,
+          codeExecution: { enabled: true, foregroundWaitMs: 120_000 },
+        }),
+        /foregroundWaitMs \(120000\) must be an integer from 0 to 60000/,
       );
     } finally {
       rmSync(tempDir, { recursive: true, force: true });

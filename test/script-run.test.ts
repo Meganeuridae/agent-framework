@@ -49,6 +49,32 @@ describe('ScriptRun observation lifecycle', () => {
     assert.deepEqual(h.notifications, [false]);
   });
 
+  it('an unbounded observation waits for completion instead of timing out', async () => {
+    const h = harness();
+    let settled = false;
+    const wait = h.run.observe(Infinity, 'continue').then((o) => { settled = true; return o; });
+    await new Promise(r => setTimeout(r, 30));
+    assert.equal(settled, false, 'Infinity must not become an immediate timer');
+    h.complete();
+    assert.deepEqual(await wait, { result: h.result, endTurn: false });
+    assert.deepEqual(h.notifications, [false]);
+  });
+
+  it('a rejected completion settles as a failed result instead of leaving the run pending', async () => {
+    const notifications: boolean[] = [];
+    const run = new ScriptRun(Promise.reject(new Error('runner broke')), (_r, notify) => { notifications.push(notify); });
+    const observed = await Promise.race([
+      run.observe(Infinity, 'continue'),
+      new Promise<'pending'>(r => setTimeout(() => r('pending'), 500)),
+    ]);
+    assert.notEqual(observed, 'pending');
+    const result = (observed as { result?: ExecResult }).result!;
+    assert.equal(result.returnCode, 1);
+    assert.equal(result.aborted, true);
+    assert.match(result.stderr, /runner broke/);
+    assert.deepEqual(notifications, [false]);
+  });
+
   it('operator release ends all active observations and leaves execution alive', async () => {
     const h = harness();
     const a = h.run.observe(60_000, 'continue');
