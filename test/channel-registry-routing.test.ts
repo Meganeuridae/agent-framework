@@ -590,3 +590,73 @@ test('proseTargetFor: no token when none is safe (shared id across servers, whit
   assert.equal(registry.proseTargetFor('chan:8', 'discord-a'), '#only-a');
   assert.equal(registry.proseTargetFor('chan:8', 'discord-b'), undefined);
 });
+
+/** Mark a seeded channel as not a conversation, as terminal-sessions does. */
+function refuseSpeech(lookup: (id: string) => { descriptor: { metadata?: Record<string, unknown> } } | undefined, channelId: string): void {
+  lookup(channelId)!.descriptor.metadata = { ...lookup(channelId)!.descriptor.metadata, speech: 'none' };
+}
+
+test('a wake from a speech-none channel (a terminal session) routes bare prose to the default channel, and does not open the terminal', async () => {
+  // The trunk agent's turn was triggered by a terminal completion: the active
+  // channel is terminal:build. Its last human message came in chanA.
+  const active: Record<string, string> = { sol: 'terminal:build' };
+  const { registry, publishCalls, openCalls, lookup } = makeRegistry(
+    { delivered: true },
+    () => undefined,
+    (n) => active[n],
+  );
+  seedRegistered(registry, 'discord', 'chanA');
+  registry.handleIncoming('discord', incoming('chanA', 'kick off the build?'));
+  seedRegistered(registry, 'terminal', 'terminal:build');
+  refuseSpeech(lookup, 'terminal:build');
+  lookup('terminal:build')!.open = false;
+
+  const locus = registry.resolveLocus('sol');
+  assert.equal(locus, 'chanA', 'the terminal channel is skipped; the default (last inbound) channel is the locus');
+  assert.equal(registry.buildChannelContext('sol')?.defaultOutgoing?.channelId, 'chanA', 'the agent is told the same channel');
+
+  const res = await registry.routeSpeech('sol', 'The build passed.', locus);
+  assert.deepEqual(res, { delivered: true, channelId: 'chanA' });
+  assert.equal(publishCalls.at(-1)?.channelId, 'chanA');
+  assert.equal(openCalls.length, 0, 'the terminal channel was not opened by delivery');
+  assert.equal(lookup('terminal:build')!.open, false);
+  assert.equal(registry.getDesiredState('terminal', 'terminal:build'), undefined, 'no durable desire to keep it open');
+});
+
+test('a wake from a speech-none channel with nothing else to speak into leaves the turn without a locus, and the terminal closed', async () => {
+  const active: Record<string, string> = { sol: 'terminal:build' };
+  const { registry, failures, openCalls, lookup } = makeRegistry({ delivered: true }, () => undefined, (n) => active[n]);
+  seedRegistered(registry, 'terminal', 'terminal:build');
+  refuseSpeech(lookup, 'terminal:build');
+  lookup('terminal:build')!.open = false;
+
+  assert.equal(registry.resolveLocus('sol'), null);
+  assert.equal(registry.buildChannelContext('sol')?.defaultOutgoing, undefined);
+  const res = await registry.routeSpeech('sol', 'The build passed.', null);
+  assert.equal(res, null, 'prose stays in the archive, as for any turn without a locus');
+  assert.equal(failures.length, 1);
+  assert.match(failures[0]!.reason, /no locus/);
+  assert.equal(openCalls.length, 0);
+});
+
+test('a speech-none home channel is skipped too, and an explicit send to a speech-none channel still delivers', async () => {
+  const { registry, publishCalls, openCalls, lookup } = makeRegistry(
+    { delivered: true },
+    (n) => (n === 'fork-1' ? 'terminal:build' : undefined),
+  );
+  seedRegistered(registry, 'discord', 'chanA');
+  registry.handleIncoming('discord', incoming('chanA', 'hello'));
+  seedRegistered(registry, 'terminal', 'terminal:build');
+  refuseSpeech(lookup, 'terminal:build');
+  lookup('terminal:build')!.open = false;
+
+  assert.equal(registry.resolveLocus('fork-1'), 'chanA', 'a home that refuses speech yields to the next candidate');
+
+  // Addressed on purpose (an explicit target), the channel takes the text: the
+  // server records it as a note for observers. That is a deliberate act, and
+  // it opens the channel as any delivery does.
+  const res = await registry.routeSpeech('fork-1', 'leaving a note on the build', 'terminal:build');
+  assert.deepEqual(res, { delivered: true, channelId: 'terminal:build' });
+  assert.equal(publishCalls.at(-1)?.channelId, 'terminal:build');
+  assert.equal(openCalls.length, 1);
+});

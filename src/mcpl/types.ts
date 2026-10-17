@@ -967,7 +967,12 @@ export interface ChannelDescriptor {
   /** Platform-specific address (e.g., { guild: "acme", channel: "#general" }) */
   address?: Record<string, unknown>;
 
-  /** Arbitrary metadata */
+  /**
+   * Arbitrary metadata. One key the host reads: `speech: 'none'` marks a
+   * channel that is not a conversation (a terminal session, a feed), so an
+   * agent's ordinary prose is never routed to it automatically and a wake
+   * from it does not make it the turn's locus; explicit sends still reach it.
+   */
   metadata?: Record<string, unknown>;
 
   /**

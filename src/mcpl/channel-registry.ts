@@ -1462,7 +1462,7 @@ export class ChannelRegistry {
     // agent was told the wrong channel under concurrency.
     const home = agentName ? this.homeChannelResolver?.(agentName) : undefined;
     const active = agentName ? this.activeChannelResolver?.(agentName) : undefined;
-    const outgoing = home ?? active ?? this.defaultPublishChannel;
+    const outgoing = this.firstSpeakable(home, active, this.defaultPublishChannel);
 
     if (openChannels.length === 0 && !outgoing) {
       return undefined;
@@ -3052,8 +3052,33 @@ export class ChannelRegistry {
   }
 
   resolveLocus(conversationId: string): string | null {
-    const home = this.homeChannelResolver?.(conversationId);
-    return home ?? this.activeChannelResolver?.(conversationId) ?? this.defaultPublishChannel ?? null;
+    return this.firstSpeakable(
+      this.homeChannelResolver?.(conversationId),
+      this.activeChannelResolver?.(conversationId),
+      this.defaultPublishChannel,
+    );
+  }
+
+  /**
+   * The first candidate locus, in precedence order, that may carry an
+   * agent's ordinary prose. A channel whose descriptor carries
+   * `metadata.speech: 'none'` is not a conversation: a server registers one
+   * for something it reports on (terminal-sessions marks every session
+   * channel so). A wake from it is a notification, not an invitation to
+   * reply there, so bare prose routes past it to the next candidate, and the
+   * channel is not opened by delivery. An explicit send to it still goes
+   * (routeSpeech takes the pinned target as given); only the automatic
+   * destination skips it.
+   */
+  private firstSpeakable(...candidates: Array<string | null | undefined>): string | null {
+    for (const candidate of candidates) {
+      if (candidate && !this.refusesSpeech(candidate)) return candidate;
+    }
+    return null;
+  }
+
+  private refusesSpeech(channelId: string): boolean {
+    return this.findChannelEntry(channelId)?.descriptor.metadata?.speech === 'none';
   }
 
   async routeSpeech(
