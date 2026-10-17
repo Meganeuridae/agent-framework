@@ -970,8 +970,10 @@ export interface ChannelDescriptor {
   /**
    * Arbitrary metadata. One key the host reads: `speech: 'none'` marks a
    * channel that is not a conversation (a terminal session, a feed), so an
-   * agent's ordinary prose is never routed to it automatically and a wake
-   * from it does not make it the turn's locus; explicit sends still reach it.
+   * agent's ordinary prose is never routed to it automatically. A wake from
+   * it, a message from it, and the agent's own channel_open of it don't make
+   * it the turn's locus, and a publish that names no channel doesn't go
+   * there. A send that names it still reaches it.
    */
   metadata?: Record<string, unknown>;
 
